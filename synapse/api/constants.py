@@ -27,7 +27,9 @@ import enum
 from typing import Final
 
 # the max size of a (canonical-json-encoded) event
-MAX_PDU_SIZE = 65536
+# MAX_PDU_SIZE = 65536
+# new size is 10MB but it should be written in bytes
+MAX_PDU_SIZE = 10 * 1024 * 1024
 
 # the "depth" field on events is limited to 2**63 - 1
 MAX_DEPTH = 2**63 - 1
