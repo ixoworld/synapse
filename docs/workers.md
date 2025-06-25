@@ -177,11 +177,11 @@ The following applies to Synapse installations that have been installed from sou
 
 You can start the main Synapse process with Poetry by running the following command:
 ```console
-poetry run synapse_homeserver --config-file [your homeserver.yaml]
+poetry run synapse_homeserver --config-path [your homeserver.yaml]
 ```
 For worker setups, you can run the following command
 ```console
-poetry run synapse_worker --config-file [your homeserver.yaml] --config-file [your worker.yaml]
+poetry run synapse_worker --config-path [your homeserver.yaml] --config-path [your worker.yaml]
 ```
 ## Available worker applications
 
@@ -200,6 +200,7 @@ information.
     ^/_matrix/client/(api/v1|r0|v3)/rooms/[^/]+/initialSync$
 
     # Federation requests
+    ^/_matrix/federation/v1/version$
     ^/_matrix/federation/v1/event/
     ^/_matrix/federation/v1/state/
     ^/_matrix/federation/v1/state_ids/
@@ -249,13 +250,14 @@ information.
     ^/_matrix/client/(api/v1|r0|v3|unstable)/directory/room/.*$
     ^/_matrix/client/(r0|v3|unstable)/capabilities$
     ^/_matrix/client/(r0|v3|unstable)/notifications$
+    ^/_synapse/admin/v1/rooms/
 
     # Encryption requests
     ^/_matrix/client/(r0|v3|unstable)/keys/query$
     ^/_matrix/client/(r0|v3|unstable)/keys/changes$
     ^/_matrix/client/(r0|v3|unstable)/keys/claim$
     ^/_matrix/client/(r0|v3|unstable)/room_keys/
-    ^/_matrix/client/(r0|v3|unstable)/keys/upload/
+    ^/_matrix/client/(r0|v3|unstable)/keys/upload$
 
     # Registration/login requests
     ^/_matrix/client/(api/v1|r0|v3|unstable)/login$
@@ -273,23 +275,21 @@ information.
     ^/_matrix/client/(api/v1|r0|v3|unstable)/knock/
     ^/_matrix/client/(api/v1|r0|v3|unstable)/profile/
 
-    # Account data requests
-    ^/_matrix/client/(r0|v3|unstable)/.*/tags
-    ^/_matrix/client/(r0|v3|unstable)/.*/account_data
-
-    # Receipts requests
-    ^/_matrix/client/(r0|v3|unstable)/rooms/.*/receipt
-    ^/_matrix/client/(r0|v3|unstable)/rooms/.*/read_markers
-
-    # Presence requests
-    ^/_matrix/client/(api/v1|r0|v3|unstable)/presence/
-
     # User directory search requests
     ^/_matrix/client/(r0|v3|unstable)/user_directory/search$
 
 Additionally, the following REST endpoints can be handled for GET requests:
 
     ^/_matrix/client/(api/v1|r0|v3|unstable)/pushrules/
+    ^/_matrix/client/unstable/org.matrix.msc4140/delayed_events
+    ^/_matrix/client/(api/v1|r0|v3|unstable)/devices/
+
+    # Account data requests
+    ^/_matrix/client/(r0|v3|unstable)/.*/tags
+    ^/_matrix/client/(r0|v3|unstable)/.*/account_data
+
+    # Presence requests
+    ^/_matrix/client/(api/v1|r0|v3|unstable)/presence/
 
 Pagination requests can also be handled, but all requests for a given
 room must be routed to the same instance. Additionally, care must be taken to
@@ -322,6 +322,15 @@ Ensure that all SSO logins go to a single process.
 For multiple workers not handling the SSO endpoints properly, see
 [#7530](https://github.com/matrix-org/synapse/issues/7530) and
 [#9427](https://github.com/matrix-org/synapse/issues/9427).
+
+Additionally, when MSC3861 is enabled (`experimental_features.msc3861.enabled`
+set to `true`), the following endpoints can be handled by the worker:
+
+    ^/_synapse/admin/v2/users/[^/]+$
+    ^/_synapse/admin/v1/username_available$
+    ^/_synapse/admin/v1/users/[^/]+/_allow_cross_signing_replacement_without_uia$
+    # Only the GET method:
+    ^/_synapse/admin/v1/users/[^/]+/devices$
 
 Note that a [HTTP listener](usage/configuration/config_documentation.md#listeners)
 with `client` and `federation` `resources` must be configured in the

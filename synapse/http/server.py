@@ -39,6 +39,7 @@ from typing import (
     List,
     Optional,
     Pattern,
+    Protocol,
     Tuple,
     Union,
 )
@@ -46,7 +47,6 @@ from typing import (
 import attr
 import jinja2
 from canonicaljson import encode_canonical_json
-from typing_extensions import Protocol
 from zope.interface import implementer
 
 from twisted.internet import defer, interfaces
@@ -74,7 +74,6 @@ from synapse.api.errors import (
 from synapse.config.homeserver import HomeServerConfig
 from synapse.logging.context import defer_to_thread, preserve_fn, run_in_background
 from synapse.logging.opentracing import active_span, start_active_span, trace_servlet
-from synapse.types import ISynapseReactor
 from synapse.util import json_encoder
 from synapse.util.caches import intern_dict
 from synapse.util.cancellation import is_function_cancellable
@@ -234,7 +233,7 @@ def return_html_error(
 
 
 def wrap_async_request_handler(
-    h: Callable[["_AsyncResource", "SynapseRequest"], Awaitable[None]]
+    h: Callable[["_AsyncResource", "SynapseRequest"], Awaitable[None]],
 ) -> Callable[["_AsyncResource", "SynapseRequest"], "defer.Deferred[None]"]:
     """Wraps an async request handler so that it calls request.processing.
 
@@ -869,8 +868,7 @@ async def _async_write_json_to_request_in_thread(
 
     with start_active_span("encode_json_response"):
         span = active_span()
-        reactor: ISynapseReactor = request.reactor  # type: ignore
-        json_str = await defer_to_thread(reactor, encode, span)
+        json_str = await defer_to_thread(request.reactor, encode, span)
 
     _write_bytes_to_request(request, json_str)
 
@@ -922,15 +920,6 @@ def set_cors_headers(request: "SynapseRequest") -> None:
         request.setHeader(
             b"Access-Control-Expose-Headers",
             b"Synapse-Trace-Id, Server, ETag",
-        )
-    elif request.experimental_cors_msc3886:
-        request.setHeader(
-            b"Access-Control-Allow-Headers",
-            b"X-Requested-With, Content-Type, Authorization, Date, If-Match, If-None-Match",
-        )
-        request.setHeader(
-            b"Access-Control-Expose-Headers",
-            b"ETag, Location, X-Max-Bytes",
         )
     else:
         request.setHeader(

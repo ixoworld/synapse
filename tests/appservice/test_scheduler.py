@@ -2,7 +2,7 @@
 # This file is licensed under the Affero General Public License (AGPL) version 3.
 #
 # Copyright 2015, 2016 OpenMarket Ltd
-# Copyright (C) 2023 New Vector, Ltd
+# Copyright (C) 2023, 2025 New Vector, Ltd
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -150,7 +150,8 @@ class ApplicationServiceSchedulerTransactionCtrlTestCase(unittest.TestCase):
         self.assertEqual(1, len(self.txnctrl.recoverers))  # and stored
         self.assertEqual(0, txn.complete.call_count)  # txn not completed
         self.store.set_appservice_state.assert_called_once_with(
-            service, ApplicationServiceState.DOWN  # service marked as down
+            service,
+            ApplicationServiceState.DOWN,  # service marked as down
         )
 
 
@@ -231,6 +232,41 @@ class ApplicationServiceSchedulerRecovererTestCase(unittest.TestCase):
         self.clock.advance_time(16)
         self.assertEqual(1, txn.send.call_count)  # new mock reset call count
         self.assertEqual(1, txn.complete.call_count)
+        self.callback.assert_called_once_with(self.recoverer)
+
+    def test_recover_force_retry(self) -> None:
+        txn = Mock()
+        txns = [txn, None]
+        pop_txn = False
+
+        def take_txn(
+            *args: object, **kwargs: object
+        ) -> "defer.Deferred[Optional[Mock]]":
+            if pop_txn:
+                return defer.succeed(txns.pop(0))
+            else:
+                return defer.succeed(txn)
+
+        self.store.get_oldest_unsent_txn = Mock(side_effect=take_txn)
+
+        # Start the recovery, and then fail the first attempt.
+        self.recoverer.recover()
+        self.assertEqual(0, self.store.get_oldest_unsent_txn.call_count)
+        txn.send = AsyncMock(return_value=False)
+        txn.complete = AsyncMock(return_value=None)
+        self.clock.advance_time(2)
+        self.assertEqual(1, txn.send.call_count)
+        self.assertEqual(0, txn.complete.call_count)
+        self.assertEqual(0, self.callback.call_count)
+
+        # Now allow the send to succeed, and force a retry.
+        pop_txn = True  # returns the txn the first time, then no more.
+        txn.send = AsyncMock(return_value=True)  # successfully send the txn
+        self.recoverer.force_retry()
+        self.assertEqual(1, txn.send.call_count)  # new mock reset call count
+        self.assertEqual(1, txn.complete.call_count)
+
+        # Ensure we call the callback to say we're done!
         self.callback.assert_called_once_with(self.recoverer)
 
 

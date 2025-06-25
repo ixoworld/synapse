@@ -54,6 +54,7 @@ from synapse.config.server import ListenerConfig, TCPListenerConfig
 from synapse.federation.transport.server import TransportLayerServer
 from synapse.http.additional_resource import AdditionalResource
 from synapse.http.server import (
+    JsonResource,
     OptionsResource,
     RootOptionsRedirectResource,
     StaticResource,
@@ -61,8 +62,7 @@ from synapse.http.server import (
 from synapse.logging.context import LoggingContext
 from synapse.metrics import METRICS_PREFIX, MetricsResource, RegistryProxy
 from synapse.replication.http import REPLICATION_PREFIX, ReplicationRestResource
-from synapse.rest import ClientRestResource
-from synapse.rest.admin import AdminRestResource
+from synapse.rest import ClientRestResource, admin
 from synapse.rest.health import HealthResource
 from synapse.rest.key.v2 import KeyResource
 from synapse.rest.synapse.client import build_synapse_client_resource_tree
@@ -100,6 +100,12 @@ class SynapseHomeServer(HomeServer):
                 if name == "openid" and "federation" in res.names:
                     # Skip loading openid resource if federation is defined
                     # since federation resource will include openid
+                    continue
+                if name == "media" and (
+                    "federation" in res.names or "client" in res.names
+                ):
+                    # Skip loading media resource if federation or client are defined
+                    # since federation & client resources will include media
                     continue
                 if name == "health":
                     # Skip loading, health resource is always included
@@ -174,11 +180,14 @@ class SynapseHomeServer(HomeServer):
             if compress:
                 client_resource = gz_wrap(client_resource)
 
+            admin_resource = JsonResource(self, canonical_json=False)
+            admin.register_servlets(self, admin_resource)
+
             resources.update(
                 {
                     CLIENT_API_PREFIX: client_resource,
                     "/.well-known": well_known_resource(self),
-                    "/_synapse/admin": AdminRestResource(self),
+                    "/_synapse/admin": admin_resource,
                     **build_synapse_client_resource_tree(self),
                 }
             )
@@ -231,6 +240,14 @@ class SynapseHomeServer(HomeServer):
                     "'media' resource conflicts with enable_media_repo=False"
                 )
 
+        if name == "media":
+            resources[FEDERATION_PREFIX] = TransportLayerServer(
+                self, servlet_groups=["media"]
+            )
+            resources[CLIENT_API_PREFIX] = ClientRestResource(
+                self, servlet_groups=["media"]
+            )
+
         if name in ["keys", "federation"]:
             resources[SERVER_KEY_PREFIX] = KeyResource(self)
 
@@ -272,8 +289,7 @@ class SynapseHomeServer(HomeServer):
             elif listener.type == "metrics":
                 if not self.config.metrics.enable_metrics:
                     logger.warning(
-                        "Metrics listener configured, but "
-                        "enable_metrics is not True!"
+                        "Metrics listener configured, but enable_metrics is not True!"
                     )
                 else:
                     if isinstance(listener, TCPListenerConfig):

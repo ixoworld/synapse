@@ -70,6 +70,7 @@ class Codes(str, Enum):
     THREEPID_NOT_FOUND = "M_THREEPID_NOT_FOUND"
     THREEPID_DENIED = "M_THREEPID_DENIED"
     INVALID_USERNAME = "M_INVALID_USERNAME"
+    THREEPID_MEDIUM_NOT_SUPPORTED = "M_THREEPID_MEDIUM_NOT_SUPPORTED"
     SERVER_NOT_TRUSTED = "M_SERVER_NOT_TRUSTED"
     CONSENT_NOT_GIVEN = "M_CONSENT_NOT_GIVEN"
     CANNOT_LEAVE_SERVER_NOTICE_ROOM = "M_CANNOT_LEAVE_SERVER_NOTICE_ROOM"
@@ -87,8 +88,7 @@ class Codes(str, Enum):
     WEAK_PASSWORD = "M_WEAK_PASSWORD"
     INVALID_SIGNATURE = "M_INVALID_SIGNATURE"
     USER_DEACTIVATED = "M_USER_DEACTIVATED"
-    # USER_LOCKED = "M_USER_LOCKED"
-    USER_LOCKED = "ORG_MATRIX_MSC3939_USER_LOCKED"
+    USER_LOCKED = "M_USER_LOCKED"
     NOT_YET_UPLOADED = "M_NOT_YET_UPLOADED"
     CANNOT_OVERWRITE_MEDIA = "M_CANNOT_OVERWRITE_MEDIA"
 
@@ -101,8 +101,9 @@ class Codes(str, Enum):
     # The account has been suspended on the server.
     # By opposition to `USER_DEACTIVATED`, this is a reversible measure
     # that can possibly be appealed and reverted.
-    # Part of MSC3823.
-    USER_ACCOUNT_SUSPENDED = "ORG.MATRIX.MSC3823.USER_ACCOUNT_SUSPENDED"
+    # Introduced by MSC3823
+    # https://github.com/matrix-org/matrix-spec-proposals/pull/3823
+    USER_ACCOUNT_SUSPENDED = "M_USER_SUSPENDED"
 
     BAD_ALIAS = "M_BAD_ALIAS"
     # For restricted join rules.
@@ -128,9 +129,16 @@ class Codes(str, Enum):
     # MSC2677
     DUPLICATE_ANNOTATION = "M_DUPLICATE_ANNOTATION"
 
-    # MSC3575 we are telling the client they need to reset their sliding sync
+    # MSC3575 we are telling the client they need to expire their sliding sync
     # connection.
     UNKNOWN_POS = "M_UNKNOWN_POS"
+
+    # Part of MSC4133
+    PROFILE_TOO_LARGE = "M_PROFILE_TOO_LARGE"
+    KEY_TOO_LARGE = "M_KEY_TOO_LARGE"
+
+    # Part of MSC4155
+    INVITE_BLOCKED = "ORG.MATRIX.MSC4155.M_INVITE_BLOCKED"
 
 
 class CodeMessageException(RuntimeError):

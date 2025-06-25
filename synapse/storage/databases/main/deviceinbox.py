@@ -200,9 +200,9 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             to_stream_id=to_stream_id,
         )
 
-        assert (
-            last_processed_stream_id == to_stream_id
-        ), "Expected _get_device_messages to process all to-device messages up to `to_stream_id`"
+        assert last_processed_stream_id == to_stream_id, (
+            "Expected _get_device_messages to process all to-device messages up to `to_stream_id`"
+        )
 
         return user_id_device_id_to_messages
 
@@ -1116,7 +1116,7 @@ class DeviceInboxBackgroundUpdateStore(SQLBaseStore):
 
             txn.execute(sql, (start, stop))
 
-            destinations = {d for d, in txn}
+            destinations = {d for (d,) in txn}
             to_remove = set()
             for d in destinations:
                 try:

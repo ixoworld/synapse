@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 from synapse.api.errors import Codes, NotFoundError, SynapseError
 from synapse.handlers.pagination import PURGE_HISTORY_ACTION_NAME
-from synapse.http.server import HttpServer, JsonResource
+from synapse.http.server import HttpServer
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseRequest
 from synapse.rest.admin._base import admin_patterns, assert_requester_is_admin
@@ -51,6 +51,7 @@ from synapse.rest.admin.background_updates import (
 from synapse.rest.admin.devices import (
     DeleteDevicesRestServlet,
     DeviceRestServlet,
+    DevicesGetRestServlet,
     DevicesRestServlet,
 )
 from synapse.rest.admin.event_reports import (
@@ -86,6 +87,7 @@ from synapse.rest.admin.rooms import (
     RoomStateRestServlet,
     RoomTimestampToEventRestServlet,
 )
+from synapse.rest.admin.scheduled_tasks import ScheduledTasksRestServlet
 from synapse.rest.admin.server_notice_servlet import SendServerNoticeServlet
 from synapse.rest.admin.statistics import (
     LargestRoomsStatistics,
@@ -98,6 +100,8 @@ from synapse.rest.admin.users import (
     DeactivateAccountRestServlet,
     PushersRestServlet,
     RateLimitRestServlet,
+    RedactUser,
+    RedactUserStatus,
     ResetPasswordRestServlet,
     SearchUsersRestServlet,
     ShadowBanRestServlet,
@@ -105,6 +109,8 @@ from synapse.rest.admin.users import (
     UserAdminServlet,
     UserByExternalId,
     UserByThreePid,
+    UserInvitesCount,
+    UserJoinedRoomCount,
     UserMembershipRestServlet,
     UserRegisterServlet,
     UserReplaceMasterCrossSigningKeyRestServlet,
@@ -201,8 +207,7 @@ class PurgeHistoryRestServlet(RestServlet):
             (stream, topo, _event_id) = r
             token = "t%d-%d" % (topo, stream)
             logger.info(
-                "[purge] purging up to token %s (received_ts %i => "
-                "stream_ordering %i)",
+                "[purge] purging up to token %s (received_ts %i => stream_ordering %i)",
                 token,
                 ts,
                 stream_ordering,
@@ -259,27 +264,24 @@ class PurgeHistoryStatusRestServlet(RestServlet):
 ########################################################################################
 
 
-class AdminRestResource(JsonResource):
-    """The REST resource which gets mounted at /_synapse/admin"""
-
-    def __init__(self, hs: "HomeServer"):
-        JsonResource.__init__(self, hs, canonical_json=False)
-        register_servlets(hs, self)
-
-
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     """
     Register all the admin servlets.
     """
-    # Admin servlets aren't registered on workers.
+    RoomRestServlet(hs).register(http_server)
+
+    # Admin servlets below may not work on workers.
     if hs.config.worker.worker_app is not None:
+        # Some admin servlets can be mounted on workers when MSC3861 is enabled.
+        if hs.config.experimental.msc3861.enabled:
+            register_servlets_for_msc3861_delegation(hs, http_server)
+
         return
 
     register_servlets_for_client_rest_resource(hs, http_server)
     BlockRoomRestServlet(hs).register(http_server)
     ListRoomRestServlet(hs).register(http_server)
     RoomStateRestServlet(hs).register(http_server)
-    RoomRestServlet(hs).register(http_server)
     RoomRestV2Servlet(hs).register(http_server)
     RoomMembersRestServlet(hs).register(http_server)
     DeleteRoomStatusByDeleteIdRestServlet(hs).register(http_server)
@@ -319,6 +321,10 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     UserReplaceMasterCrossSigningKeyRestServlet(hs).register(http_server)
     UserByExternalId(hs).register(http_server)
     UserByThreePid(hs).register(http_server)
+    RedactUser(hs).register(http_server)
+    RedactUserStatus(hs).register(http_server)
+    UserInvitesCount(hs).register(http_server)
+    UserJoinedRoomCount(hs).register(http_server)
 
     DeviceRestServlet(hs).register(http_server)
     DevicesRestServlet(hs).register(http_server)
@@ -328,8 +334,8 @@ def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
     BackgroundUpdateRestServlet(hs).register(http_server)
     BackgroundUpdateStartJobRestServlet(hs).register(http_server)
     ExperimentalFeaturesRestServlet(hs).register(http_server)
-    if hs.config.experimental.msc3823_account_suspension:
-        SuspendAccountRestServlet(hs).register(http_server)
+    SuspendAccountRestServlet(hs).register(http_server)
+    ScheduledTasksRestServlet(hs).register(http_server)
 
 
 def register_servlets_for_client_rest_resource(
@@ -357,4 +363,16 @@ def register_servlets_for_client_rest_resource(
         ListMediaInRoom(hs).register(http_server)
 
     # don't add more things here: new servlets should only be exposed on
-    # /_synapse/admin so should not go here. Instead register them in AdminRestResource.
+    # /_synapse/admin so should not go here. Instead register them in register_servlets.
+
+
+def register_servlets_for_msc3861_delegation(
+    hs: "HomeServer", http_server: HttpServer
+) -> None:
+    """Register servlets needed by MAS when MSC3861 is enabled"""
+    assert hs.config.experimental.msc3861.enabled
+
+    UserRestServletV2(hs).register(http_server)
+    UsernameAvailableRestServlet(hs).register(http_server)
+    UserReplaceMasterCrossSigningKeyRestServlet(hs).register(http_server)
+    DevicesGetRestServlet(hs).register(http_server)

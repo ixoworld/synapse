@@ -143,9 +143,9 @@ class MessageHandler:
         elif membership == Membership.LEAVE:
             key = (event_type, state_key)
             # If the membership is not JOIN, then the event ID should exist.
-            assert (
-                membership_event_id is not None
-            ), "check_user_in_room_or_world_readable returned invalid data"
+            assert membership_event_id is not None, (
+                "check_user_in_room_or_world_readable returned invalid data"
+            )
             room_state = await self._state_storage_controller.get_state_for_events(
                 [membership_event_id], StateFilter.from_types([key])
             )
@@ -196,7 +196,9 @@ class MessageHandler:
             AuthError (403) if the user doesn't have permission to view
             members of this room.
         """
-        state_filter = state_filter or StateFilter.all()
+        if state_filter is None:
+            state_filter = StateFilter.all()
+
         user_id = requester.user.to_string()
 
         if at_token:
@@ -240,9 +242,9 @@ class MessageHandler:
                 room_state = await self.store.get_events(state_ids.values())
             elif membership == Membership.LEAVE:
                 # If the membership is not JOIN, then the event ID should exist.
-                assert (
-                    membership_event_id is not None
-                ), "check_user_in_room_or_world_readable returned invalid data"
+                assert membership_event_id is not None, (
+                    "check_user_in_room_or_world_readable returned invalid data"
+                )
                 room_state_events = (
                     await self._state_storage_controller.get_state_for_events(
                         [membership_event_id], state_filter=state_filter
@@ -493,6 +495,7 @@ class EventCreationHandler:
         self._instance_name = hs.get_instance_name()
         self._notifier = hs.get_notifier()
         self._worker_lock_handler = hs.get_worker_locks_handler()
+        self._policy_handler = hs.get_room_policy_handler()
 
         self.room_prejoin_state_types = self.hs.config.api.room_prejoin_state
 
@@ -642,11 +645,33 @@ class EventCreationHandler:
         """
         await self.auth_blocking.check_auth_blocking(requester=requester)
 
-        if event_dict["type"] == EventTypes.Message:
-            requester_suspended = await self.store.get_user_suspended_status(
-                requester.user.to_string()
-            )
-            if requester_suspended:
+        requester_suspended = await self.store.get_user_suspended_status(
+            requester.user.to_string()
+        )
+        if requester_suspended:
+            # We want to allow suspended users to perform "corrective" actions
+            # asked of them by server admins, such as redact their messages and
+            # leave rooms.
+            if event_dict["type"] in ["m.room.redaction", "m.room.member"]:
+                if event_dict["type"] == "m.room.redaction":
+                    event = await self.store.get_event(
+                        event_dict["content"]["redacts"], allow_none=True
+                    )
+                    if event:
+                        if event.sender != requester.user.to_string():
+                            raise SynapseError(
+                                403,
+                                "You can only redact your own events while account is suspended.",
+                                Codes.USER_ACCOUNT_SUSPENDED,
+                            )
+                if event_dict["type"] == "m.room.member":
+                    if event_dict["content"]["membership"] != "leave":
+                        raise SynapseError(
+                            403,
+                            "Changing membership while account is suspended is not allowed.",
+                            Codes.USER_ACCOUNT_SUSPENDED,
+                        )
+            else:
                 raise SynapseError(
                     403,
                     "Sending messages while account is suspended is not allowed.",
@@ -1084,6 +1109,18 @@ class EventCreationHandler:
                     event.sender,
                 )
 
+                policy_allowed = await self._policy_handler.is_event_allowed(event)
+                if not policy_allowed:
+                    logger.warning(
+                        "Event not allowed by policy server, rejecting %s",
+                        event.event_id,
+                    )
+                    raise SynapseError(
+                        403,
+                        "This message has been rejected as probable spam",
+                        Codes.FORBIDDEN,
+                    )
+
                 spam_check_result = (
                     await self._spam_checker_module_callbacks.check_event_for_spam(
                         event
@@ -1095,7 +1132,7 @@ class EventCreationHandler:
                             [code, dict] = spam_check_result
                             raise SynapseError(
                                 403,
-                                "This message had been rejected as probable spam",
+                                "This message has been rejected as probable spam",
                                 code,
                                 dict,
                             )
@@ -1225,10 +1262,9 @@ class EventCreationHandler:
             )
 
         if prev_event_ids is not None:
-            assert (
-                len(prev_event_ids) <= 10
-            ), "Attempting to create an event with %i prev_events" % (
-                len(prev_event_ids),
+            assert len(prev_event_ids) <= 10, (
+                "Attempting to create an event with %i prev_events"
+                % (len(prev_event_ids),)
             )
         else:
             prev_event_ids = await self.store.get_prev_events_for_room(builder.room_id)
@@ -1243,12 +1279,14 @@ class EventCreationHandler:
                 # Allow an event to have empty list of prev_event_ids
                 # only if it has auth_event_ids.
                 or auth_event_ids
-            ), "Attempting to create a non-m.room.create event with no prev_events or auth_event_ids"
+            ), (
+                "Attempting to create a non-m.room.create event with no prev_events or auth_event_ids"
+            )
         else:
             # we now ought to have some prev_events (unless it's a create event).
-            assert (
-                builder.type == EventTypes.Create or prev_event_ids
-            ), "Attempting to create a non-m.room.create event with no prev_events"
+            assert builder.type == EventTypes.Create or prev_event_ids, (
+                "Attempting to create a non-m.room.create event with no prev_events"
+            )
 
         if for_batch:
             assert prev_event_ids is not None
@@ -1438,6 +1476,12 @@ class EventCreationHandler:
                         prev_event.event_id,
                     )
                     return prev_event
+
+            if not event.is_state() and event.type in [
+                EventTypes.Message,
+                EventTypes.Encrypted,
+            ]:
+                await self.store.set_room_participation(event.user_id, event.room_id)
 
             if event.internal_metadata.is_out_of_band_membership():
                 # the only sort of out-of-band-membership events we expect to see here are

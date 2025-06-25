@@ -20,8 +20,7 @@
 #
 #
 
-"""An interactive script for doing a release. See `cli()` below.
-"""
+"""An interactive script for doing a release. See `cli()` below."""
 
 import glob
 import json
@@ -41,7 +40,7 @@ import commonmark
 import git
 from click.exceptions import ClickException
 from git import GitCommandError, Repo
-from github import Github
+from github import BadCredentialsException, Github
 from packaging import version
 
 
@@ -255,6 +254,12 @@ def _prepare() -> None:
     # Update the version specified in pyproject.toml.
     subprocess.check_output(["poetry", "version", new_version])
 
+    # Update config schema $id.
+    schema_file = "schema/synapse-config.schema.yaml"
+    major_minor_version = ".".join(new_version.split(".")[:2])
+    url = f"https://element-hq.github.io/synapse/schema/synapse/v{major_minor_version}/synapse-config.schema.json"
+    subprocess.check_output(["sed", "-i", f"0,/^\\$id: .*/s||$id: {url}|", schema_file])
+
     # Generate changelogs.
     generate_and_write_changelog(synapse_repo, current_version, new_version)
 
@@ -323,6 +328,9 @@ def tag(gh_token: Optional[str]) -> None:
 
 def _tag(gh_token: Optional[str]) -> None:
     """Tags the release and generates a draft GitHub release"""
+
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
 
     # Make sure we're in a git repo.
     repo = get_repo_and_check_clean_checkout()
@@ -418,6 +426,11 @@ def publish(gh_token: str) -> None:
 def _publish(gh_token: str) -> None:
     """Publish release on GitHub."""
 
+    if gh_token:
+        # Test that the GH Token is valid before continuing.
+        gh = Github(gh_token)
+        gh.get_user()
+
     # Make sure we're in a git repo.
     get_repo_and_check_clean_checkout()
 
@@ -459,6 +472,9 @@ def upload(gh_token: Optional[str]) -> None:
 
 def _upload(gh_token: Optional[str]) -> None:
     """Upload release to pypi."""
+
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
 
     current_version = get_package_version()
     tag_name = f"v{current_version}"
@@ -555,6 +571,9 @@ def wait_for_actions(gh_token: Optional[str]) -> None:
 
 
 def _wait_for_actions(gh_token: Optional[str]) -> None:
+    # Test that the GH Token is valid before continuing.
+    check_valid_gh_token(gh_token)
+
     # Find out the version and tag name.
     current_version = get_package_version()
     tag_name = f"v{current_version}"
@@ -579,7 +598,7 @@ def _wait_for_actions(gh_token: Optional[str]) -> None:
         if all(
             workflow["status"] != "in_progress" for workflow in resp["workflow_runs"]
         ):
-            success = (
+            success = all(
                 workflow["status"] == "completed" for workflow in resp["workflow_runs"]
             )
             if success:
@@ -711,6 +730,11 @@ Ask the designated people to do the blog and tweets."""
 @cli.command()
 @click.option("--gh-token", envvar=["GH_TOKEN", "GITHUB_TOKEN"], required=True)
 def full(gh_token: str) -> None:
+    if gh_token:
+        # Test that the GH Token is valid before continuing.
+        gh = Github(gh_token)
+        gh.get_user()
+
     click.echo("1. If this is a security release, read the security wiki page.")
     click.echo("2. Check for any release blockers before proceeding.")
     click.echo("    https://github.com/element-hq/synapse/labels/X-Release-Blocker")
@@ -780,6 +804,22 @@ def get_repo_and_check_clean_checkout(
     if repo.is_dirty():
         raise click.ClickException(f"Uncommitted changes exist in {path}.")
     return repo
+
+
+def check_valid_gh_token(gh_token: Optional[str]) -> None:
+    """Check that a github token is valid, if supplied"""
+
+    if not gh_token:
+        # No github token supplied, so nothing to do.
+        return
+
+    try:
+        gh = Github(gh_token)
+
+        # We need to lookup name to trigger a request.
+        _name = gh.get_user().name
+    except BadCredentialsException as e:
+        raise click.ClickException(f"Github credentials are bad: {e}")
 
 
 def find_ref(repo: git.Repo, ref_name: str) -> Optional[git.HEAD]:

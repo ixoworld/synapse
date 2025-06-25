@@ -53,6 +53,7 @@ from synapse.metrics import event_processing_positions
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.replication.http.push import ReplicationCopyPusherRestServlet
 from synapse.storage.databases.main.state_deltas import StateDelta
+from synapse.storage.invite_rule import InviteRule
 from synapse.types import (
     JsonDict,
     Requester,
@@ -158,6 +159,7 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             store=self.store,
             clock=self.clock,
             cfg=hs.config.ratelimiting.rc_invites_per_room,
+            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
         )
 
         # Ratelimiter for invites, keyed by recipient (across all rooms, all
@@ -166,6 +168,7 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             store=self.store,
             clock=self.clock,
             cfg=hs.config.ratelimiting.rc_invites_per_user,
+            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
         )
 
         # Ratelimiter for invites, keyed by issuer (across all rooms, all
@@ -174,6 +177,7 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             store=self.store,
             clock=self.clock,
             cfg=hs.config.ratelimiting.rc_invites_per_issuer,
+            ratelimit_callbacks=hs.get_module_api_callbacks().ratelimit,
         )
 
         self._third_party_invite_limiter = Ratelimiter(
@@ -912,6 +916,21 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
                     additional_fields=block_invite_result[1],
                 )
 
+            # check the invitee's configuration and apply rules. Admins on the server can bypass.
+            if not is_requester_admin:
+                invite_config = await self.store.get_invite_config_for_user(target_id)
+                rule = invite_config.get_invite_rule(requester.user.to_string())
+                if rule == InviteRule.BLOCK:
+                    logger.info(
+                        f"Automatically rejecting invite from {target_id} due to the the invite filtering rules of {requester.user}"
+                    )
+                    raise SynapseError(
+                        403,
+                        "You are not permitted to invite this user.",
+                        errcode=Codes.INVITE_BLOCKED,
+                    )
+                # InviteRule.IGNORE is handled at the sync layer.
+
         # An empty prev_events list is allowed as long as the auth_event_ids are present
         if prev_event_ids is not None:
             return await self._local_membership_update(
@@ -1190,6 +1209,26 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
             origin_server_ts=origin_server_ts,
         )
 
+    async def check_for_any_membership_in_room(
+        self, *, user_id: str, room_id: str
+    ) -> None:
+        """
+        Check if the user has any membership in the room and raise error if not.
+
+        Args:
+            user_id: The user to check.
+            room_id: The room to check.
+
+        Raises:
+            AuthError if the user doesn't have any membership in the room.
+        """
+        result = await self.store.get_local_current_membership_for_user_in_room(
+            user_id=user_id, room_id=room_id
+        )
+
+        if result is None or result == (None, None):
+            raise AuthError(403, f"User {user_id} has no membership in room {room_id}")
+
     async def _should_perform_remote_join(
         self,
         user_id: str,
@@ -1302,11 +1341,11 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
         # If this is going to be a local join, additional information must
         # be included in the event content in order to efficiently validate
         # the event.
-        content[EventContentFields.AUTHORISING_USER] = (
-            await self.event_auth_handler.get_user_which_could_invite(
-                room_id,
-                state_before_join,
-            )
+        content[
+            EventContentFields.AUTHORISING_USER
+        ] = await self.event_auth_handler.get_user_which_could_invite(
+            room_id,
+            state_before_join,
         )
 
         return False, []
@@ -1415,9 +1454,9 @@ class RoomMemberHandler(metaclass=abc.ABCMeta):
 
         if requester is not None:
             sender = UserID.from_string(event.sender)
-            assert (
-                sender == requester.user
-            ), "Sender (%s) must be same as requester (%s)" % (sender, requester.user)
+            assert sender == requester.user, (
+                "Sender (%s) must be same as requester (%s)" % (sender, requester.user)
+            )
             assert self.hs.is_mine(sender), "Sender must be our own: %s" % (sender,)
         else:
             requester = types.create_requester(target_user)

@@ -20,6 +20,7 @@
 #
 
 """Contains functions for performing actions on rooms."""
+
 import itertools
 import logging
 import math
@@ -467,17 +468,6 @@ class RoomCreationHandler:
         """
         user_id = requester.user.to_string()
 
-        spam_check = await self._spam_checker_module_callbacks.user_may_create_room(
-            user_id
-        )
-        if spam_check != self._spam_checker_module_callbacks.NOT_SPAM:
-            raise SynapseError(
-                403,
-                "You are not permitted to create rooms",
-                errcode=spam_check[0],
-                additional_fields=spam_check[1],
-            )
-
         creation_content: JsonDict = {
             "room_version": new_room_version.identifier,
             "predecessor": {"room_id": old_room_id, "event_id": tombstone_event_id},
@@ -583,6 +573,24 @@ class RoomCreationHandler:
         # Raise the requester's power level in the new room if necessary
         if current_power_level_int < needed_power_level:
             user_power_levels[user_id] = needed_power_level
+
+        # We construct what the body of a call to /createRoom would look like for passing
+        # to the spam checker. We don't include a preset here, as we expect the
+        # initial state to contain everything we need.
+        spam_check = await self._spam_checker_module_callbacks.user_may_create_room(
+            user_id,
+            {
+                "creation_content": creation_content,
+                "initial_state": list(initial_state.items()),
+            },
+        )
+        if spam_check != self._spam_checker_module_callbacks.NOT_SPAM:
+            raise SynapseError(
+                403,
+                "You are not permitted to create rooms",
+                errcode=spam_check[0],
+                additional_fields=spam_check[1],
+            )
 
         await self._send_events_for_new_room(
             requester,
@@ -785,7 +793,7 @@ class RoomCreationHandler:
 
         if not is_requester_admin:
             spam_check = await self._spam_checker_module_callbacks.user_may_create_room(
-                user_id
+                user_id, config
             )
             if spam_check != self._spam_checker_module_callbacks.NOT_SPAM:
                 raise SynapseError(
@@ -900,11 +908,9 @@ class RoomCreationHandler:
         )
 
         # Check whether this visibility value is blocked by a third party module
-        allowed_by_third_party_rules = (
-            await (
-                self._third_party_event_rules.check_visibility_can_be_modified(
-                    room_id, visibility
-                )
+        allowed_by_third_party_rules = await (
+            self._third_party_event_rules.check_visibility_can_be_modified(
+                room_id, visibility
             )
         )
         if not allowed_by_third_party_rules:
@@ -1750,11 +1756,11 @@ class RoomEventSource(EventSource[RoomStreamToken, EventBase]):
                 from_key=from_key,
                 to_key=to_key,
                 limit=limit or 10,
-                order="ASC",
+                direction=Direction.FORWARDS,
             )
 
             events = list(room_events)
-            events.extend(e for evs, _ in room_to_events.values() for e in evs)
+            events.extend(e for evs, _, _ in room_to_events.values() for e in evs)
 
             # We know stream_ordering must be not None here, as its been
             # persisted, but mypy doesn't know that
@@ -1807,7 +1813,7 @@ class RoomShutdownHandler:
         ] = None,
     ) -> Optional[ShutdownRoomResponse]:
         """
-        Shuts down a room. Moves all local users and room aliases automatically
+        Shuts down a room. Moves all joined local users and room aliases automatically
         to a new room if `new_room_user_id` is set. Otherwise local users only
         leave the room without any information.
 
@@ -1950,16 +1956,17 @@ class RoomShutdownHandler:
 
                 # Join users to new room
                 if new_room_user_id:
-                    assert new_room_id is not None
-                    await self.room_member_handler.update_membership(
-                        requester=target_requester,
-                        target=target_requester.user,
-                        room_id=new_room_id,
-                        action=Membership.JOIN,
-                        content={},
-                        ratelimit=False,
-                        require_consent=False,
-                    )
+                    if membership == Membership.JOIN:
+                        assert new_room_id is not None
+                        await self.room_member_handler.update_membership(
+                            requester=target_requester,
+                            target=target_requester.user,
+                            room_id=new_room_id,
+                            action=Membership.JOIN,
+                            content={},
+                            ratelimit=False,
+                            require_consent=False,
+                        )
 
                 result["kicked_users"].append(user_id)
                 if update_result_fct:

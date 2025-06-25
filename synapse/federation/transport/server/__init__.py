@@ -20,9 +20,7 @@
 #
 #
 import logging
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Type
-
-from typing_extensions import Literal
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional, Tuple, Type
 
 from synapse.api.errors import FederationDeniedError, SynapseError
 from synapse.federation.transport.server._base import (
@@ -271,6 +269,10 @@ SERVLET_GROUPS: Dict[str, Iterable[Type[BaseFederationServlet]]] = {
     "federation": FEDERATION_SERVLET_CLASSES,
     "room_list": (PublicRoomList,),
     "openid": (OpenIdUserInfo,),
+    "media": (
+        FederationMediaDownloadServlet,
+        FederationMediaThumbnailServlet,
+    ),
 }
 
 
