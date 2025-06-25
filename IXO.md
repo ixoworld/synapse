@@ -12,6 +12,10 @@ Please list changes below based of which ixo tag version the customization will 
 
 - Increasing API `MAX_PDU_SIZE` to 10MB for handling of ai-oracles events.
 
+#### v1.132.0-ixo.1
+
+- Version bump with upstream changes.
+
 ## Contributing
 
 Below are the steps to contribute to Ixo Synapse with your own custom configurations, or to update the existing code with latest upstream changes.
