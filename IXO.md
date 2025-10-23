@@ -16,6 +16,10 @@ Please list changes below based of which ixo tag version the customization will 
 
 - Version bump with upstream changes.
 
+#### v1.140.0-ixo.1
+
+- Version bump with upstream changes.
+
 ## Contributing
 
 Below are the steps to contribute to Ixo Synapse with your own custom configurations, or to update the existing code with latest upstream changes.
@@ -49,7 +53,7 @@ git commit -m "feat: add customizations"
 # 9. Run tests and make sure everything works with your customizations
 
 # 10. Create a new tag for your customized version
-git tag -a v1.132.0-ixo -m "Synapse v1.132.0 with IXO customizations"
+git tag -a v1.140.0-ixo -m "Synapse v1.140.0 with IXO customizations"
 
 # 11. Push ixo custom branch and the new tags
 git push origin ixo --follow-tags
@@ -57,8 +61,8 @@ git push origin ixo --follow-tags
 # git push origin 1.119.0-ixo
 
 # 12. Build and push your Docker image
-DOCKER_BUILDKIT=1 docker build --platform=linux/amd64 -t ghcr.io/ixoworld/synapse:v1.132.0-ixo.1 -f docker/Dockerfile .
-docker push ghcr.io/ixoworld/synapse:v1.132.0-ixo.1
+DOCKER_BUILDKIT=1 docker build --platform=linux/amd64 -t ghcr.io/ixoworld/synapse:v1.140.0-ixo.1 -f docker/Dockerfile .
+docker push ghcr.io/ixoworld/synapse:v1.140.0-ixo.1
 ```
 
 # Resources
