@@ -43,14 +43,16 @@ from prometheus_client import Gauge
 from twisted.internet import defer
 from twisted.python.failure import Failure
 
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.util.async_helpers import ObservableDeferred
 from synapse.util.caches.lrucache import LruCache
 from synapse.util.caches.treecache import TreeCache, iterate_tree_cache_entry
+from synapse.util.clock import Clock
 
 cache_pending_metric = Gauge(
     "synapse_util_caches_cache_pending",
     "Number of lookups currently pending for this cache",
-    ["name"],
+    labelnames=["name", SERVER_NAME_LABEL],
 )
 
 T = TypeVar("T")
@@ -79,7 +81,10 @@ class DeferredCache(Generic[KT, VT]):
 
     def __init__(
         self,
+        *,
         name: str,
+        clock: Clock,
+        server_name: str,
         max_entries: int = 1000,
         tree: bool = False,
         iterable: bool = False,
@@ -89,6 +94,8 @@ class DeferredCache(Generic[KT, VT]):
         """
         Args:
             name: The name of the cache
+            server_name: server_name: The homeserver name that this cache is associated with
+                (used to label the metric) (`hs.hostname`).
             max_entries: Maximum amount of entries that the cache will hold
             tree: Use a TreeCache instead of a dict as the underlying cache type
             iterable: If True, count each item in the cached object as an entry,
@@ -98,6 +105,7 @@ class DeferredCache(Generic[KT, VT]):
             prune_unread_entries: If True, cache entries that haven't been read recently
                 will be evicted from the cache in the background. Set to False to
                 opt-out of this behaviour.
+            clock: The homeserver `Clock` instance
         """
         cache_type = TreeCache if tree else dict
 
@@ -107,12 +115,16 @@ class DeferredCache(Generic[KT, VT]):
         ] = cache_type()
 
         def metrics_cb() -> None:
-            cache_pending_metric.labels(name).set(len(self._pending_deferred_cache))
+            cache_pending_metric.labels(
+                name=name, **{SERVER_NAME_LABEL: server_name}
+            ).set(len(self._pending_deferred_cache))
 
         # cache is used for completed results and maps to the result itself, rather than
         # a Deferred.
         self.cache: LruCache[KT, VT] = LruCache(
             max_size=max_entries,
+            clock=clock,
+            server_name=server_name,
             cache_name=name,
             cache_type=cache_type,
             size_callback=(

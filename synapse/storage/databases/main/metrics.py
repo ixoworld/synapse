@@ -23,7 +23,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Dict, List, Tuple, cast
 
-from synapse.metrics import GaugeBucketCollector
+from synapse.metrics import SERVER_NAME_LABEL, GaugeBucketCollector
 from synapse.metrics.background_process_metrics import wrap_as_background_process
 from synapse.storage._base import SQLBaseStore
 from synapse.storage.database import (
@@ -42,9 +42,10 @@ logger = logging.getLogger(__name__)
 
 # Collect metrics on the number of forward extremities that exist.
 _extremities_collecter = GaugeBucketCollector(
-    "synapse_forward_extremities",
-    "Number of rooms on the server with the given number of forward extremities"
+    name="synapse_forward_extremities",
+    documentation="Number of rooms on the server with the given number of forward extremities"
     " or fewer",
+    labelnames=[SERVER_NAME_LABEL],
     buckets=[1, 2, 3, 5, 7, 10, 15, 20, 50, 100, 200, 500],
 )
 
@@ -54,9 +55,10 @@ _extremities_collecter = GaugeBucketCollector(
 # we could remove from state resolution by reducing the graph to a single
 # forward extremity.
 _excess_state_events_collecter = GaugeBucketCollector(
-    "synapse_excess_extremity_events",
-    "Number of rooms on the server with the given number of excess extremity "
+    name="synapse_excess_extremity_events",
+    documentation="Number of rooms on the server with the given number of excess extremity "
     "events, or fewer",
+    labelnames=[SERVER_NAME_LABEL],
     buckets=[0] + [1 << n for n in range(12)],
 )
 
@@ -76,7 +78,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
 
         # Read the extrems every 60 minutes
         if hs.config.worker.run_background_tasks:
-            self._clock.looping_call(self._read_forward_extremities, 60 * 60 * 1000)
+            self.clock.looping_call(self._read_forward_extremities, 60 * 60 * 1000)
 
         # Used in _generate_user_daily_visits to keep track of progress
         self._last_user_visit_update = self._get_start_of_day()
@@ -100,10 +102,12 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
 
         res = await self.db_pool.runInteraction("read_forward_extremities", fetch)
 
-        _extremities_collecter.update_data(x[0] for x in res)
+        _extremities_collecter.update_data(
+            values=(x[0] for x in res), labels=(self.server_name,)
+        )
 
         _excess_state_events_collecter.update_data(
-            (x[0] - 1) * x[1] for x in res if x[1]
+            values=((x[0] - 1) * x[1] for x in res if x[1]), labels=(self.server_name,)
         )
 
     async def count_daily_e2ee_messages(self) -> int:
@@ -220,7 +224,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
         """
         Counts the number of users who used this homeserver in the last 24 hours.
         """
-        yesterday = int(self._clock.time_msec()) - (1000 * 60 * 60 * 24)
+        yesterday = int(self.clock.time_msec()) - (1000 * 60 * 60 * 24)
         return await self.db_pool.runInteraction(
             "count_daily_users", self._count_users, yesterday
         )
@@ -232,7 +236,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
         from the mau figure in synapse.storage.monthly_active_users which,
         amongst other things, includes a 3 day grace period before a user counts.
         """
-        thirty_days_ago = int(self._clock.time_msec()) - (1000 * 60 * 60 * 24 * 30)
+        thirty_days_ago = int(self.clock.time_msec()) - (1000 * 60 * 60 * 24 * 30)
         return await self.db_pool.runInteraction(
             "count_monthly_users", self._count_users, thirty_days_ago
         )
@@ -277,7 +281,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
 
         def _count_r30v2_users(txn: LoggingTransaction) -> Dict[str, int]:
             thirty_days_in_secs = 86400 * 30
-            now = int(self._clock.time())
+            now = int(self.clock.time())
             sixty_days_ago_in_secs = now - 2 * thirty_days_in_secs
             one_day_from_now_in_secs = now + 86400
 
@@ -385,7 +389,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
         """
         Returns millisecond unixtime for start of UTC day.
         """
-        now = time.gmtime(self._clock.time())
+        now = time.gmtime(self.clock.time())
         today_start = calendar.timegm((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0))
         return today_start * 1000
 
@@ -399,7 +403,7 @@ class ServerMetricsStore(EventPushActionsWorkerStore, SQLBaseStore):
             logger.info("Calling _generate_user_daily_visits")
             today_start = self._get_start_of_day()
             a_day_in_milliseconds = 24 * 60 * 60 * 1000
-            now = self._clock.time_msec()
+            now = self.clock.time_msec()
 
             # A note on user_agent. Technically a given device can have multiple
             # user agents, so we need to decide which one to pick. We could have

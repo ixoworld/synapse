@@ -34,6 +34,7 @@ from synapse.metrics.background_process_metrics import wrap_as_background_proces
 from synapse.storage.database import LoggingTransaction
 from synapse.storage.databases import Databases
 from synapse.types.storage import _BackgroundUpdates
+from synapse.util.stringutils import shortstr
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -45,6 +46,8 @@ class PurgeEventsStorageController:
     """High level interface for purging rooms and event history."""
 
     def __init__(self, hs: "HomeServer", stores: Databases):
+        self.hs = hs  # nb must be called this for @wrap_as_background_process
+        self.server_name = hs.hostname
         self.stores = stores
 
         if hs.config.worker.run_background_tasks:
@@ -167,6 +170,12 @@ class PurgeEventsStorageController:
                 break
 
             (room_id, groups_to_sequences) = next_to_delete
+
+            logger.info(
+                "[purge] deleting state groups for room %s: %s",
+                room_id,
+                shortstr(groups_to_sequences.keys(), maxitems=10),
+            )
             made_progress = await self._delete_state_groups(
                 room_id, groups_to_sequences
             )

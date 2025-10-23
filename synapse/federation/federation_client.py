@@ -74,6 +74,7 @@ from synapse.federation.transport.client import SendJoinResponse
 from synapse.http.client import is_unknown_endpoint
 from synapse.http.types import QueryParams
 from synapse.logging.opentracing import SynapseTags, log_kv, set_tag, tag_args, trace
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.types import JsonDict, StrCollection, UserID, get_domain_from_id
 from synapse.types.handlers.policy_server import RECOMMENDATION_OK, RECOMMENDATION_SPAM
 from synapse.util.async_helpers import concurrently_execute
@@ -85,7 +86,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-sent_queries_counter = Counter("synapse_federation_client_sent_queries", "", ["type"])
+sent_queries_counter = Counter(
+    "synapse_federation_client_sent_queries", "", labelnames=["type", SERVER_NAME_LABEL]
+)
 
 
 PDU_RETRY_TIME_MS = 1 * 60 * 1000
@@ -137,13 +140,15 @@ class FederationClient(FederationBase):
         self.state = hs.get_state_handler()
         self.transport_layer = hs.get_federation_transport_client()
 
-        self.hostname = hs.hostname
+        self.server_name = hs.hostname
         self.signing_key = hs.signing_key
 
         # Cache mapping `event_id` to a tuple of the event itself and the `pull_origin`
         # (which server we pulled the event from)
         self._get_pdu_cache: ExpiringCache[str, Tuple[EventBase, str]] = ExpiringCache(
             cache_name="get_pdu_cache",
+            server_name=self.server_name,
+            hs=self.hs,
             clock=self._clock,
             max_len=1000,
             expiry_ms=120 * 1000,
@@ -162,6 +167,8 @@ class FederationClient(FederationBase):
             Tuple[JsonDict, Sequence[JsonDict], Sequence[JsonDict], Sequence[str]],
         ] = ExpiringCache(
             cache_name="get_room_hierarchy_cache",
+            server_name=self.server_name,
+            hs=self.hs,
             clock=self._clock,
             max_len=1000,
             expiry_ms=5 * 60 * 1000,
@@ -207,7 +214,10 @@ class FederationClient(FederationBase):
         Returns:
             The JSON object from the response
         """
-        sent_queries_counter.labels(query_type).inc()
+        sent_queries_counter.labels(
+            type=query_type,
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         return await self.transport_layer.make_query(
             destination,
@@ -229,7 +239,10 @@ class FederationClient(FederationBase):
         Returns:
             The JSON object from the response
         """
-        sent_queries_counter.labels("client_device_keys").inc()
+        sent_queries_counter.labels(
+            type="client_device_keys",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
         return await self.transport_layer.query_client_keys(
             destination, content, timeout
         )
@@ -240,7 +253,10 @@ class FederationClient(FederationBase):
         """Query the device keys for a list of user ids hosted on a remote
         server.
         """
-        sent_queries_counter.labels("user_devices").inc()
+        sent_queries_counter.labels(
+            type="user_devices",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
         return await self.transport_layer.query_user_devices(
             destination, user_id, timeout
         )
@@ -262,7 +278,10 @@ class FederationClient(FederationBase):
         Returns:
             The JSON object from the response
         """
-        sent_queries_counter.labels("client_one_time_keys").inc()
+        sent_queries_counter.labels(
+            type="client_one_time_keys",
+            **{SERVER_NAME_LABEL: self.server_name},
+        ).inc()
 
         # Convert the query with counts into a stable and unstable query and check
         # if attempting to claim more than 1 OTK.
@@ -477,6 +496,43 @@ class FederationClient(FederationBase):
                 e,
             )
             return RECOMMENDATION_OK
+
+    @trace
+    @tag_args
+    async def ask_policy_server_to_sign_event(
+        self, destination: str, pdu: EventBase, timeout: Optional[int] = None
+    ) -> Optional[JsonDict]:
+        """Requests that the destination server (typically a policy server)
+        sign the event as not spam.
+
+        If the policy server could not be contacted or the policy server
+        returned an error, this returns no signature.
+
+        Args:
+            destination: The remote homeserver to ask (a policy server)
+            pdu: The event to sign
+            timeout: How long to try (in ms) the destination for before
+                giving up. None indicates no timeout.
+        Returns:
+            The signature from the policy server, structured in the same was as the 'signatures'
+            JSON in the event e.g { "$policy_server_via_domain" : { "ed25519:policy_server": "signature_base64" }}
+        """
+        logger.debug(
+            "ask_policy_server_to_sign_event for event_id=%s from %s",
+            pdu.event_id,
+            destination,
+        )
+        try:
+            return await self.transport_layer.ask_policy_server_to_sign_event(
+                destination, pdu, timeout=timeout
+            )
+        except Exception as e:
+            logger.warning(
+                "ask_policy_server_to_sign_event: server %s responded with error: %s",
+                destination,
+                e,
+            )
+        return None
 
     @trace
     @tag_args
@@ -1068,7 +1124,7 @@ class FederationClient(FederationBase):
             # there's some we never care about
             ev = builder.create_local_event_from_event_dict(
                 self._clock,
-                self.hostname,
+                self.server_name,
                 self.signing_key,
                 room_version=room_version,
                 event_dict=pdu_dict,
@@ -1818,7 +1874,7 @@ class FederationClient(FederationBase):
             )
             return timestamp_to_event_response
         except SynapseError as e:
-            logger.warn(
+            logger.warning(
                 "timestamp_to_event(room_id=%s, timestamp=%s, direction=%s): encountered error when trying to fetch from destinations: %s",
                 room_id,
                 timestamp,

@@ -61,8 +61,7 @@ from synapse.logging.context import (
     current_context,
     make_deferred_yieldable,
 )
-from synapse.metrics import LaterGauge, register_threadpool
-from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.metrics import SERVER_NAME_LABEL, register_threadpool
 from synapse.storage.background_updates import BackgroundUpdater
 from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.types import Connection, Cursor, SQLQueryParameters
@@ -82,11 +81,23 @@ sql_logger = logging.getLogger("synapse.storage.SQL")
 transaction_logger = logging.getLogger("synapse.storage.txn")
 perf_logger = logging.getLogger("synapse.storage.TIME")
 
-sql_scheduling_timer = Histogram("synapse_storage_schedule_time", "sec")
+sql_scheduling_timer = Histogram(
+    "synapse_storage_schedule_time", "sec", labelnames=[SERVER_NAME_LABEL]
+)
 
-sql_query_timer = Histogram("synapse_storage_query_time", "sec", ["verb"])
-sql_txn_count = Counter("synapse_storage_transaction_time_count", "sec", ["desc"])
-sql_txn_duration = Counter("synapse_storage_transaction_time_sum", "sec", ["desc"])
+sql_query_timer = Histogram(
+    "synapse_storage_query_time", "sec", labelnames=["verb", SERVER_NAME_LABEL]
+)
+sql_txn_count = Counter(
+    "synapse_storage_transaction_time_count",
+    "sec",
+    labelnames=["desc", SERVER_NAME_LABEL],
+)
+sql_txn_duration = Counter(
+    "synapse_storage_transaction_time_sum",
+    "sec",
+    labelnames=["desc", SERVER_NAME_LABEL],
+)
 
 
 # Unique indexes which have been added in background updates. Maps from table name
@@ -118,9 +129,11 @@ class _PoolConnection(Connection):
 
 
 def make_pool(
+    *,
     reactor: IReactorCore,
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
+    server_name: str,
 ) -> adbapi.ConnectionPool:
     """Get the connection pool for the database."""
 
@@ -132,9 +145,14 @@ def make_pool(
     def _on_new_connection(conn: Connection) -> None:
         # Ensure we have a logging context so we can correctly track queries,
         # etc.
-        with LoggingContext("db.on_new_connection"):
+        with LoggingContext(name="db.on_new_connection", server_name=server_name):
             engine.on_new_connection(
-                LoggingDatabaseConnection(conn, engine, "on_new_connection")
+                LoggingDatabaseConnection(
+                    conn=conn,
+                    engine=engine,
+                    default_txn_name="on_new_connection",
+                    server_name=server_name,
+                )
             )
 
     connection_pool = adbapi.ConnectionPool(
@@ -144,15 +162,21 @@ def make_pool(
         **db_args,
     )
 
-    register_threadpool(f"database-{db_config.name}", connection_pool.threadpool)
+    register_threadpool(
+        name=f"database-{db_config.name}",
+        server_name=server_name,
+        threadpool=connection_pool.threadpool,
+    )
 
     return connection_pool
 
 
 def make_conn(
+    *,
     db_config: DatabaseConnectionConfig,
     engine: BaseDatabaseEngine,
     default_txn_name: str,
+    server_name: str,
 ) -> "LoggingDatabaseConnection":
     """Make a new connection to the database and return it.
 
@@ -166,13 +190,18 @@ def make_conn(
         if not k.startswith("cp_")
     }
     native_db_conn = engine.module.connect(**db_params)
-    db_conn = LoggingDatabaseConnection(native_db_conn, engine, default_txn_name)
+    db_conn = LoggingDatabaseConnection(
+        conn=native_db_conn,
+        engine=engine,
+        default_txn_name=default_txn_name,
+        server_name=server_name,
+    )
 
     engine.on_new_connection(db_conn)
     return db_conn
 
 
-@attr.s(slots=True, auto_attribs=True)
+@attr.s(slots=True, auto_attribs=True, kw_only=True)
 class LoggingDatabaseConnection:
     """A wrapper around a database connection that returns `LoggingTransaction`
     as its cursor class.
@@ -183,6 +212,7 @@ class LoggingDatabaseConnection:
     conn: Connection
     engine: BaseDatabaseEngine
     default_txn_name: str
+    server_name: str
 
     def cursor(
         self,
@@ -196,8 +226,9 @@ class LoggingDatabaseConnection:
             txn_name = self.default_txn_name
 
         return LoggingTransaction(
-            self.conn.cursor(),
+            txn=self.conn.cursor(),
             name=txn_name,
+            server_name=self.server_name,
             database_engine=self.engine,
             after_callbacks=after_callbacks,
             async_after_callbacks=async_after_callbacks,
@@ -266,6 +297,7 @@ class LoggingTransaction:
     __slots__ = [
         "txn",
         "name",
+        "server_name",
         "database_engine",
         "after_callbacks",
         "async_after_callbacks",
@@ -274,8 +306,10 @@ class LoggingTransaction:
 
     def __init__(
         self,
+        *,
         txn: Cursor,
         name: str,
+        server_name: str,
         database_engine: BaseDatabaseEngine,
         after_callbacks: Optional[List[_CallbackListEntry]] = None,
         async_after_callbacks: Optional[List[_AsyncCallbackListEntry]] = None,
@@ -283,6 +317,7 @@ class LoggingTransaction:
     ):
         self.txn = txn
         self.name = name
+        self.server_name = server_name
         self.database_engine = database_engine
         self.after_callbacks = after_callbacks
         self.async_after_callbacks = async_after_callbacks
@@ -493,7 +528,9 @@ class LoggingTransaction:
         finally:
             secs = time.time() - start
             sql_logger.debug("[SQL time] {%s} %f sec", self.name, secs)
-            sql_query_timer.labels(sql.split()[0]).observe(secs)
+            sql_query_timer.labels(
+                verb=sql.split()[0], **{SERVER_NAME_LABEL: self.server_name}
+            ).observe(secs)
 
     def close(self) -> None:
         self.txn.close()
@@ -561,18 +598,18 @@ class DatabasePool:
         engine: BaseDatabaseEngine,
     ):
         self.hs = hs
+        self.server_name = hs.hostname
         self._clock = hs.get_clock()
         self._txn_limit = database_config.config.get("txn_limit", 0)
         self._database_config = database_config
-        self._db_pool = make_pool(hs.get_reactor(), database_config, engine)
+        self._db_pool = make_pool(
+            reactor=hs.get_reactor(),
+            db_config=database_config,
+            engine=engine,
+            server_name=self.server_name,
+        )
 
         self.updates = BackgroundUpdater(hs, self)
-        LaterGauge(
-            "synapse_background_update_status",
-            "Background update status",
-            [],
-            self.updates.get_status,
-        )
 
         self._previous_txn_total_time = 0.0
         self._current_txn_total_time = 0.0
@@ -600,10 +637,16 @@ class DatabasePool:
         # background updates of tables that aren't safe to update.
         self._clock.call_later(
             0.0,
-            run_as_background_process,
+            self.hs.run_as_background_process,
             "upsert_safety_check",
             self._check_safe_to_upsert,
         )
+
+    def stop_background_updates(self) -> None:
+        """
+        Stops the database from running any further background updates.
+        """
+        self.updates.shutdown()
 
     def name(self) -> str:
         "Return the name of this database"
@@ -642,7 +685,7 @@ class DatabasePool:
         if background_update_names:
             self._clock.call_later(
                 15.0,
-                run_as_background_process,
+                self.hs.run_as_background_process,
                 "upsert_safety_check",
                 self._check_safe_to_upsert,
             )
@@ -866,8 +909,14 @@ class DatabasePool:
 
             self._current_txn_total_time += duration
             self._txn_perf_counters.update(desc, duration)
-            sql_txn_count.labels(desc).inc(1)
-            sql_txn_duration.labels(desc).inc(duration)
+            sql_txn_count.labels(
+                desc=desc,
+                **{SERVER_NAME_LABEL: self.server_name},
+            ).inc(1)
+            sql_txn_duration.labels(
+                desc=desc,
+                **{SERVER_NAME_LABEL: self.server_name},
+            ).inc(duration)
 
     async def runInteraction(
         self,
@@ -997,13 +1046,17 @@ class DatabasePool:
             assert not self.engine.in_transaction(conn)
 
             with LoggingContext(
-                str(curr_context), parent_context=parent_context
+                name=str(curr_context),
+                server_name=self.server_name,
+                parent_context=parent_context,
             ) as context:
                 with opentracing.start_active_span(
                     operation_name="db.connection",
                 ):
                     sched_duration_sec = monotonic_time() - start_time
-                    sql_scheduling_timer.observe(sched_duration_sec)
+                    sql_scheduling_timer.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).observe(sched_duration_sec)
                     context.add_database_scheduled(sched_duration_sec)
 
                     if self._txn_limit > 0:
@@ -1036,7 +1089,10 @@ class DatabasePool:
                             )
 
                         db_conn = LoggingDatabaseConnection(
-                            conn, self.engine, "runWithConnection"
+                            conn=conn,
+                            engine=self.engine,
+                            default_txn_name="runWithConnection",
+                            server_name=self.server_name,
                         )
                         return func(db_conn, *args, **kwargs)
                     finally:
@@ -1478,13 +1534,49 @@ class DatabasePool:
         """
         Upsert, many times.
 
+        This executes a query equivalent to `INSERT INTO ... ON CONFLICT DO UPDATE`,
+        with multiple value rows.
+        The query may use emulated upserts if the database engine does not support upserts,
+        or if the table is currently unsafe to upsert.
+
+        If there are no value columns, this instead generates a `ON CONFLICT DO NOTHING`.
+
         Args:
             table: The table to upsert into
-            key_names: The key column names.
-            key_values: A list of each row's key column values.
-            value_names: The value column names
-            value_values: A list of each row's value column values.
+            key_names: The unique key column names. These are the columns used in the ON CONFLICT clause.
+            key_values: A list of each row's key column values, in the same order as `key_names`.
+            value_names: The non-unique value column names
+            value_values: A list of each row's value column values, in the same order as `value_names`.
                 Ignored if value_names is empty.
+
+        Example:
+            ```python
+            simple_upsert_many(
+                "mytable",
+                key_names=("room_id", "user_id"),
+                key_values=[
+                    ("!room1:example.org", "@user1:example.org"),
+                    ("!room2:example.org", "@user2:example.org"),
+                ],
+                value_names=("wombat_count", "is_updated"),
+                value_values=[
+                    (42, True),
+                    (7, False)
+                ],
+            )
+            ```
+
+            gives something equivalent to:
+
+            ```sql
+            INSERT INTO mytable (room_id, user_id, wombat_count, is_updated)
+            VALUES
+                ('!room1:example.org', '@user1:example.org', 42, True),
+                ('!room2:example.org', '@user2:example.org', 7, False)
+            ON CONFLICT DO UPDATE SET
+                wombat_count = EXCLUDED.wombat_count,
+                is_updated = EXCLUDED.is_updated
+            ```
         """
 
         # We can autocommit if it safe to upsert
@@ -1512,6 +1604,8 @@ class DatabasePool:
     ) -> None:
         """
         Upsert, many times.
+
+        See the documentation for `simple_upsert_many` for examples.
 
         Args:
             table: The table to upsert into
@@ -2564,12 +2658,19 @@ def make_in_list_sql_clause(
 
 
 # These overloads ensure that `columns` and `iterable` values have the same length.
-# Suppress "Single overload definition, multiple required" complaint.
-@overload  # type: ignore[misc]
+@overload
 def make_tuple_in_list_sql_clause(
     database_engine: BaseDatabaseEngine,
     columns: Tuple[str, str],
     iterable: Collection[Tuple[Any, Any]],
+) -> Tuple[str, list]: ...
+
+
+@overload
+def make_tuple_in_list_sql_clause(
+    database_engine: BaseDatabaseEngine,
+    columns: Tuple[str, str, str],
+    iterable: Collection[Tuple[Any, Any, Any]],
 ) -> Tuple[str, list]: ...
 
 

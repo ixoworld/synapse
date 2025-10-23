@@ -21,6 +21,7 @@
 
 
 import itertools
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Collection, Iterable, List, Optional, Tuple
 
@@ -41,7 +42,6 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
 )
-from synapse.storage.databases.main.events import SLIDING_SYNC_RELEVANT_STATE_SET
 from synapse.storage.engines import PostgresEngine
 from synapse.storage.util.id_generators import MultiWriterIdGenerator
 from synapse.util.caches.descriptors import CachedFunction
@@ -62,6 +62,12 @@ PURGE_HISTORY_CACHE_NAME = "ph_cache_fake"
 
 # As above, but for invalidating room caches on room deletion
 DELETE_ROOM_CACHE_NAME = "dr_cache_fake"
+
+# This cache takes a list of tuples as its first argument, which requires
+# special handling.
+GET_E2E_CROSS_SIGNING_SIGNATURES_FOR_DEVICE_CACHE_NAME = (
+    "_get_e2e_cross_signing_signatures_for_device"
+)
 
 # How long between cache invalidation table cleanups, once we have caught up
 # with the backlog.
@@ -105,10 +111,11 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
             # caches to invalidate. (This reduces the amount of writes to the DB
             # that happen).
             self._cache_id_gen = MultiWriterIdGenerator(
-                db_conn,
-                database,
+                db_conn=db_conn,
+                db=database,
                 notifier=hs.get_replication_notifier(),
                 stream_name="caches",
+                server_name=self.server_name,
                 instance_name=hs.get_instance_name(),
                 tables=[
                     (
@@ -270,6 +277,33 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
                     # room membership.
                     #
                     # self._membership_stream_cache.all_entities_changed(token)  # type: ignore[attr-defined]
+                elif (
+                    row.cache_func
+                    == GET_E2E_CROSS_SIGNING_SIGNATURES_FOR_DEVICE_CACHE_NAME
+                ):
+                    # "keys" is a list of strings, where each string is a
+                    # JSON-encoded representation of the tuple keys, i.e.
+                    # keys: ['["@userid:domain", "DEVICEID"]','["@userid2:domain", "DEVICEID2"]']
+                    #
+                    # This is a side-effect of not being able to send nested
+                    # information over replication.
+                    for json_str in row.keys:
+                        try:
+                            user_id, device_id = json.loads(json_str)
+                        except (json.JSONDecodeError, TypeError):
+                            logger.error(
+                                "Failed to deserialise cache key as valid JSON: %s",
+                                json_str,
+                            )
+                            continue
+
+                        # Invalidate each key.
+                        #
+                        # Note: .invalidate takes a tuple of arguments, hence the need
+                        # to nest our tuple in another tuple.
+                        self._get_e2e_cross_signing_signatures_for_device.invalidate(  # type: ignore[attr-defined]
+                            ((user_id, device_id),)
+                        )
                 else:
                     self._attempt_to_invalidate_cache(row.cache_func, row.keys)
 
@@ -284,6 +318,11 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
         super().process_replication_position(stream_name, instance_name, token)
 
     def _process_event_stream_row(self, token: int, row: EventsStreamRow) -> None:
+        # This is needed to avoid a circular import.
+        from synapse.storage.databases.main.events import (
+            SLIDING_SYNC_RELEVANT_STATE_SET,
+        )
+
         data = row.data
 
         if row.type == EventsStreamEventRow.TypeId:
@@ -347,6 +386,11 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
         relates_to: Optional[str],
         backfilled: bool,
     ) -> None:
+        # This is needed to avoid a circular import.
+        from synapse.storage.databases.main.events import (
+            SLIDING_SYNC_RELEVANT_STATE_SET,
+        )
+
         # XXX: If you add something to this function make sure you add it to
         # `_invalidate_caches_for_room_events` as well.
 
@@ -707,7 +751,7 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
                     "instance_name": self._instance_name,
                     "cache_func": cache_name,
                     "keys": keys,
-                    "invalidation_ts": self._clock.time_msec(),
+                    "invalidation_ts": self.clock.time_msec(),
                 },
             )
 
@@ -734,7 +778,7 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
             assert self._cache_id_gen is not None
 
             stream_ids = self._cache_id_gen.get_next_mult_txn(txn, len(key_tuples))
-            ts = self._clock.time_msec()
+            ts = self.clock.time_msec()
             txn.call_after(self.hs.get_notifier().on_new_replication_data)
             self.db_pool.simple_insert_many_txn(
                 txn,
@@ -786,7 +830,8 @@ class CacheInvalidationWorkerStore(SQLBaseStore):
             next_interval = REGULAR_CLEANUP_INTERVAL_MS
 
         self.hs.get_clock().call_later(
-            next_interval / 1000, self._clean_up_cache_invalidation_wrapper
+            next_interval / 1000,
+            self._clean_up_cache_invalidation_wrapper,
         )
 
     async def _clean_up_batch_of_old_cache_invalidations(

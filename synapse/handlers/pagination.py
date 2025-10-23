@@ -29,7 +29,6 @@ from synapse.api.filtering import Filter
 from synapse.events.utils import SerializeEventConfig
 from synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME
 from synapse.logging.opentracing import trace
-from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.rest.admin._base import assert_user_is_admin
 from synapse.streams.config import PaginationConfig
 from synapse.types import (
@@ -79,12 +78,12 @@ class PaginationHandler:
 
     def __init__(self, hs: "HomeServer"):
         self.hs = hs
+        self.server_name = hs.hostname
         self.auth = hs.get_auth()
         self.store = hs.get_datastores().main
         self._storage_controllers = hs.get_storage_controllers()
         self._state_storage_controller = self._storage_controllers.state
         self.clock = hs.get_clock()
-        self._server_name = hs.hostname
         self._room_shutdown_handler = hs.get_room_shutdown_handler()
         self._relations_handler = hs.get_relations_handler()
         self._worker_locks = hs.get_worker_locks_handler()
@@ -116,7 +115,7 @@ class PaginationHandler:
                 logger.info("Setting up purge job with config: %s", job)
 
                 self.clock.looping_call(
-                    run_as_background_process,
+                    self.hs.run_as_background_process,
                     job.interval,
                     "purge_history_for_rooms_in_range",
                     self.purge_history_for_rooms_in_range,
@@ -243,7 +242,7 @@ class PaginationHandler:
             # We want to purge everything, including local events, and to run the purge in
             # the background so that it's not blocking any other operation apart from
             # other purges in the same room.
-            run_as_background_process(
+            self.hs.run_as_background_process(
                 PURGE_HISTORY_ACTION_NAME,
                 self.purge_history,
                 room_id,
@@ -395,7 +394,7 @@ class PaginationHandler:
             write=True,
         ):
             # first check that we have no users in this room
-            joined = await self.store.is_host_joined(room_id, self._server_name)
+            joined = await self.store.is_host_joined(room_id, self.server_name)
             if joined:
                 if force:
                     logger.info(
@@ -602,7 +601,7 @@ class PaginationHandler:
                 # Otherwise, we can backfill in the background for eventual
                 # consistency's sake but we don't need to block the client waiting
                 # for a costly federation call and processing.
-                run_as_background_process(
+                self.hs.run_as_background_process(
                     "maybe_backfill_in_the_background",
                     self.hs.get_federation_handler().maybe_backfill,
                     room_id,

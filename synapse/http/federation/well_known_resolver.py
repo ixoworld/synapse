@@ -27,7 +27,6 @@ from typing import Callable, Dict, Optional, Tuple
 import attr
 
 from twisted.internet import defer
-from twisted.internet.interfaces import IReactorTime
 from twisted.web.client import RedirectAgent
 from twisted.web.http import stringToDatetime
 from twisted.web.http_headers import Headers
@@ -35,8 +34,10 @@ from twisted.web.iweb import IAgent, IResponse
 
 from synapse.http.client import BodyExceededMaxSize, read_body_with_max_size
 from synapse.logging.context import make_deferred_yieldable
-from synapse.util import Clock, json_decoder
+from synapse.types import ISynapseThreadlessReactor
 from synapse.util.caches.ttlcache import TTLCache
+from synapse.util.clock import Clock
+from synapse.util.json import json_decoder
 from synapse.util.metrics import Measure
 
 # period to cache .well-known results for by default
@@ -77,10 +78,6 @@ WELL_KNOWN_RETRY_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
 
 
-_well_known_cache: TTLCache[bytes, Optional[bytes]] = TTLCache("well-known")
-_had_valid_well_known_cache: TTLCache[bytes, bool] = TTLCache("had-valid-well-known")
-
-
 @attr.s(slots=True, frozen=True, auto_attribs=True)
 class WellKnownLookupResult:
     delegated_server: Optional[bytes]
@@ -91,20 +88,38 @@ class WellKnownResolver:
 
     def __init__(
         self,
-        reactor: IReactorTime,
+        server_name: str,
+        reactor: ISynapseThreadlessReactor,
+        clock: Clock,
         agent: IAgent,
         user_agent: bytes,
         well_known_cache: Optional[TTLCache[bytes, Optional[bytes]]] = None,
         had_well_known_cache: Optional[TTLCache[bytes, bool]] = None,
     ):
+        """
+        Args:
+            server_name: Our homeserver name (used to label metrics) (`hs.hostname`).
+            reactor
+            clock: Should be the `hs` clock from `hs.get_clock()`
+            agent
+            user_agent
+            well_known_cache
+            had_well_known_cache
+        """
+
+        self.server_name = server_name
         self._reactor = reactor
-        self._clock = Clock(reactor)
+        self._clock = clock
 
         if well_known_cache is None:
-            well_known_cache = _well_known_cache
+            well_known_cache = TTLCache(
+                cache_name="well-known", server_name=server_name
+            )
 
         if had_well_known_cache is None:
-            had_well_known_cache = _had_valid_well_known_cache
+            had_well_known_cache = TTLCache(
+                cache_name="had-valid-well-known", server_name=server_name
+            )
 
         self._well_known_cache = well_known_cache
         self._had_valid_well_known_cache = had_well_known_cache
@@ -134,7 +149,13 @@ class WellKnownResolver:
         # TODO: should we linearise so that we don't end up doing two .well-known
         # requests for the same server in parallel?
         try:
-            with Measure(self._clock, "get_well_known"):
+            with Measure(
+                self._clock,
+                name="get_well_known",
+                # This should be our homeserver where the the code is running (used to
+                # label metrics)
+                server_name=self.server_name,
+            ):
                 result: Optional[bytes]
                 cache_period: float
 

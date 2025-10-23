@@ -54,8 +54,8 @@ from synapse.logging.context import (
     make_deferred_yieldable,
     run_in_background,
 )
-from synapse.util import Clock
 from synapse.util.async_helpers import DeferredEvent
+from synapse.util.clock import Clock
 from synapse.util.stringutils import is_ascii
 
 if TYPE_CHECKING:
@@ -380,12 +380,13 @@ async def respond_with_multipart_responder(
 
         try:
             await responder.write_to_consumer(multipart_consumer)
+        except ConsumerRequestedStopError as e:
+            logger.debug("Failed to write to consumer: %s %s", type(e), e)
+            # Unregister the producer, if it has one, so Twisted doesn't complain
+            if request.producer:
+                request.unregisterProducer()
         except Exception as e:
-            # The majority of the time this will be due to the client having gone
-            # away. Unfortunately, Twisted simply throws a generic exception at us
-            # in that case.
             logger.warning("Failed to write to consumer: %s %s", type(e), e)
-
             # Unregister the producer, if it has one, so Twisted doesn't complain
             if request.producer:
                 request.unregisterProducer()
@@ -426,12 +427,13 @@ async def respond_with_responder(
         add_file_headers(request, media_type, file_size, upload_name)
         try:
             await responder.write_to_consumer(request)
+        except ConsumerRequestedStopError as e:
+            logger.debug("Failed to write to consumer: %s %s", type(e), e)
+            # Unregister the producer, if it has one, so Twisted doesn't complain
+            if request.producer:
+                request.unregisterProducer()
         except Exception as e:
-            # The majority of the time this will be due to the client having gone
-            # away. Unfortunately, Twisted simply throws a generic exception at us
-            # in that case.
             logger.warning("Failed to write to consumer: %s %s", type(e), e)
-
             # Unregister the producer, if it has one, so Twisted doesn't complain
             if request.producer:
                 request.unregisterProducer()
@@ -674,6 +676,10 @@ def _parseparam(s: bytes) -> Generator[bytes, None, None]:
         s = s[end:]
 
 
+class ConsumerRequestedStopError(Exception):
+    """A consumer asked us to stop producing"""
+
+
 @implementer(interfaces.IPushProducer)
 class ThreadedFileSender:
     """
@@ -698,6 +704,7 @@ class ThreadedFileSender:
 
     def __init__(self, hs: "HomeServer") -> None:
         self.reactor = hs.get_reactor()
+        self.clock = hs.get_clock()
         self.thread_pool = hs.get_media_sender_thread_pool()
 
         self.file: Optional[BinaryIO] = None
@@ -706,7 +713,7 @@ class ThreadedFileSender:
 
         # Signals if the thread should keep reading/sending data. Set means
         # continue, clear means pause.
-        self.wakeup_event = DeferredEvent(self.reactor)
+        self.wakeup_event = DeferredEvent(self.clock)
 
         # Signals if the thread should terminate, e.g. because the consumer has
         # gone away.
@@ -751,7 +758,9 @@ class ThreadedFileSender:
         self.wakeup_event.set()
 
         if not self.deferred.called:
-            self.deferred.errback(Exception("Consumer asked us to stop producing"))
+            self.deferred.errback(
+                ConsumerRequestedStopError("Consumer asked us to stop producing")
+            )
 
     async def start_read_loop(self) -> None:
         """This is the loop that drives reading/writing"""

@@ -23,15 +23,33 @@
 import logging
 import re
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Pattern, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Pattern,
+    Sequence,
+    cast,
+)
 
 import attr
 from netaddr import IPSet
 
+from twisted.internet import reactor
+
 from synapse.api.constants import EventTypes
 from synapse.events import EventBase
-from synapse.types import DeviceListUpdates, JsonDict, JsonMapping, UserID
+from synapse.types import (
+    DeviceListUpdates,
+    ISynapseThreadlessReactor,
+    JsonDict,
+    JsonMapping,
+    UserID,
+)
 from synapse.util.caches.descriptors import _CacheContext, cached
+from synapse.util.clock import Clock
 
 if TYPE_CHECKING:
     from synapse.appservice.api import ApplicationServiceApi
@@ -78,7 +96,7 @@ class ApplicationService:
         self,
         token: str,
         id: str,
-        sender: str,
+        sender: UserID,
         url: Optional[str] = None,
         namespaces: Optional[JsonDict] = None,
         hs_token: Optional[str] = None,
@@ -96,6 +114,17 @@ class ApplicationService:
         self.hs_token = hs_token
         # The full Matrix ID for this application service's sender.
         self.sender = sender
+        # The application service user should be part of the server's domain.
+        self.server_name = sender.domain  # nb must be called this for @cached
+
+        # Ideally we would require passing in the `HomeServer` `Clock` instance.
+        # However this is not currently possible as there are places which use
+        # `@cached` that aren't aware of the `HomeServer` instance.
+        # nb must be called this for @cached
+        self.clock = Clock(
+            cast(ISynapseThreadlessReactor, reactor), server_name=self.server_name
+        )  # type: ignore[multiple-internal-clocks]
+
         self.namespaces = self._check_namespaces(namespaces)
         self.id = id
         self.ip_range_whitelist = ip_range_whitelist
@@ -223,7 +252,7 @@ class ApplicationService:
         """
         return (
             # User is the appservice's configured sender_localpart user
-            user_id == self.sender
+            user_id == self.sender.to_string()
             # User is in the appservice's user namespace
             or self.is_user_in_namespace(user_id)
         )
@@ -347,7 +376,7 @@ class ApplicationService:
     def is_exclusive_user(self, user_id: str) -> bool:
         return (
             self._is_exclusive(ApplicationService.NS_USERS, user_id)
-            or user_id == self.sender
+            or user_id == self.sender.to_string()
         )
 
     def is_interested_in_protocol(self, protocol: str) -> bool:

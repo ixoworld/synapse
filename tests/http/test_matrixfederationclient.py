@@ -27,7 +27,7 @@ from parameterized import parameterized
 from twisted.internet import defer
 from twisted.internet.defer import Deferred, TimeoutError
 from twisted.internet.error import ConnectingCancelledError, DNSLookupError
-from twisted.test.proto_helpers import MemoryReactor, StringTransport
+from twisted.internet.testing import MemoryReactor, StringTransport
 from twisted.web.client import Agent, ResponseNeverReceived
 from twisted.web.http import HTTPChannel
 from twisted.web.http_headers import Headers
@@ -48,7 +48,7 @@ from synapse.logging.context import (
     current_context,
 )
 from synapse.server import HomeServer
-from synapse.util import Clock
+from synapse.util.clock import Clock
 
 from tests.replication._base import BaseMultiWorkerStreamTestCase
 from tests.server import FakeTransport
@@ -63,10 +63,6 @@ def check_logcontext(context: LoggingContextOrSentinel) -> None:
 
 
 class FederationClientTests(HomeserverTestCase):
-    def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
-        hs = self.setup_test_homeserver(reactor=reactor, clock=clock)
-        return hs
-
     def prepare(
         self, reactor: MemoryReactor, clock: Clock, homeserver: HomeServer
     ) -> None:
@@ -80,7 +76,10 @@ class FederationClientTests(HomeserverTestCase):
 
         @defer.inlineCallbacks
         def do_request() -> Generator["Deferred[Any]", object, object]:
-            with LoggingContext("one") as context:
+            with LoggingContext(
+                name="one",
+                server_name=self.hs.hostname,
+            ) as context:
                 fetch_d = defer.ensureDeferred(
                     self.cl.get_json("testserv:8008", "foo/bar")
                 )

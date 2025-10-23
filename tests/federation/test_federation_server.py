@@ -25,7 +25,7 @@ from unittest.mock import Mock
 
 from parameterized import parameterized
 
-from twisted.test.proto_helpers import MemoryReactor
+from twisted.internet.testing import MemoryReactor
 
 from synapse.api.constants import EventTypes, Membership
 from synapse.api.errors import FederationError
@@ -40,10 +40,12 @@ from synapse.rest.client import login, room
 from synapse.server import HomeServer
 from synapse.storage.controllers.state import server_acl_evaluator_from_event
 from synapse.types import JsonDict
-from synapse.util import Clock
+from synapse.util.clock import Clock
 
 from tests import unittest
 from tests.unittest import override_config
+
+logger = logging.getLogger(__name__)
 
 
 class FederationServerTests(unittest.FederatingHomeserverTestCase):
@@ -227,7 +229,10 @@ class MessageAcceptTests(unittest.FederatingHomeserverTestCase):
             room_version=RoomVersions.V10,
         )
 
-        with LoggingContext("test-context"):
+        with LoggingContext(
+            name="test-context",
+            server_name=self.hs.hostname,
+        ):
             failure = self.get_failure(
                 self.federation_event_handler.on_receive_pdu(
                     self.OTHER_SERVER_NAME, lying_event
@@ -252,7 +257,7 @@ class MessageAcceptTests(unittest.FederatingHomeserverTestCase):
 class ServerACLsTestCase(unittest.TestCase):
     def test_blocked_server(self) -> None:
         e = _create_acl_event({"allow": ["*"], "deny": ["evil.com"]})
-        logging.info("ACL event: %s", e.content)
+        logger.info("ACL event: %s", e.content)
 
         server_acl_evalutor = server_acl_evaluator_from_event(e)
 
@@ -266,7 +271,7 @@ class ServerACLsTestCase(unittest.TestCase):
 
     def test_block_ip_literals(self) -> None:
         e = _create_acl_event({"allow_ip_literals": False, "allow": ["*"]})
-        logging.info("ACL event: %s", e.content)
+        logger.info("ACL event: %s", e.content)
 
         server_acl_evalutor = server_acl_evaluator_from_event(e)
 
@@ -533,7 +538,6 @@ class StripUnsignedFromEventsTestCase(unittest.TestCase):
             "depth": 1000,
             "origin_server_ts": 1,
             "type": "m.room.member",
-            "origin": "test.servx",
             "content": {"membership": "join"},
             "auth_events": [],
             "unsigned": {"malicious garbage": "hackz", "more warez": "more hackz"},
@@ -550,7 +554,6 @@ class StripUnsignedFromEventsTestCase(unittest.TestCase):
             "depth": 1000,
             "origin_server_ts": 1,
             "type": "m.room.member",
-            "origin": "test.servx",
             "auth_events": [],
             "content": {"membership": "join"},
             "unsigned": {
@@ -577,7 +580,6 @@ class StripUnsignedFromEventsTestCase(unittest.TestCase):
             "depth": 1000,
             "origin_server_ts": 1,
             "type": "m.room.power_levels",
-            "origin": "test.servx",
             "content": {},
             "auth_events": [],
             "unsigned": {

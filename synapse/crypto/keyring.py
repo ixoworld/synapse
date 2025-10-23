@@ -152,6 +152,8 @@ class Keyring:
     def __init__(
         self, hs: "HomeServer", key_fetchers: "Optional[Iterable[KeyFetcher]]" = None
     ):
+        self.server_name = hs.hostname
+
         if key_fetchers is None:
             # Always fetch keys from the database.
             mutable_key_fetchers: List[KeyFetcher] = [StoreKeyFetcher(hs)]
@@ -169,7 +171,8 @@ class Keyring:
         self._fetch_keys_queue: BatchingQueue[
             _FetchKeyRequest, Dict[str, Dict[str, FetchKeyResult]]
         ] = BatchingQueue(
-            "keyring_server",
+            name="keyring_server",
+            hs=hs,
             clock=hs.get_clock(),
             # The method called to fetch each key
             process_batch_callback=self._inner_fetch_key_requests,
@@ -190,6 +193,14 @@ class Keyring:
             verify_key=vk,
             valid_until_ts=2**63,  # fake future timestamp
         )
+
+    def shutdown(self) -> None:
+        """
+        Prepares the KeyRing for garbage collection by shutting down it's queues.
+        """
+        self._fetch_keys_queue.shutdown()
+        for key_fetcher in self._key_fetchers:
+            key_fetcher.shutdown()
 
     async def verify_json_for_server(
         self,
@@ -313,7 +324,7 @@ class Keyring:
             if key_result.valid_until_ts < verify_request.minimum_valid_until_ts:
                 continue
 
-            await self._process_json(key_result.verify_key, verify_request)
+            await self.process_json(key_result.verify_key, verify_request)
             verified = True
 
         if not verified:
@@ -323,7 +334,7 @@ class Keyring:
                 Codes.UNAUTHORIZED,
             )
 
-    async def _process_json(
+    async def process_json(
         self, verify_key: VerifyKey, verify_request: VerifyJsonRequest
     ) -> None:
         """Processes the `VerifyJsonRequest`. Raises if the signature can't be
@@ -473,9 +484,19 @@ class Keyring:
 
 class KeyFetcher(metaclass=abc.ABCMeta):
     def __init__(self, hs: "HomeServer"):
+        self.server_name = hs.hostname
         self._queue = BatchingQueue(
-            self.__class__.__name__, hs.get_clock(), self._fetch_keys
+            name=self.__class__.__name__,
+            hs=hs,
+            clock=hs.get_clock(),
+            process_batch_callback=self._fetch_keys,
         )
+
+    def shutdown(self) -> None:
+        """
+        Prepares the KeyFetcher for garbage collection by shutting down it's queue.
+        """
+        self._queue.shutdown()
 
     async def get_keys(
         self, server_name: str, key_ids: List[str], minimum_valid_until_ts: int

@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 from twisted.internet.interfaces import IDelayedCall
 
-from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.push import Pusher, PusherConfig, PusherConfigException, ThrottleParams
 from synapse.push.mailer import Mailer
 from synapse.push.push_types import EmailReason
@@ -68,6 +67,7 @@ class EmailPusher(Pusher):
         super().__init__(hs, pusher_config)
         self.mailer = mailer
 
+        self.server_name = hs.hostname
         self.store = self.hs.get_datastores().main
         self.email = pusher_config.pushkey
         self.timed_call: Optional[IDelayedCall] = None
@@ -117,7 +117,7 @@ class EmailPusher(Pusher):
         if self._is_processing:
             return
 
-        run_as_background_process("emailpush.process", self._process)
+        self.hs.run_as_background_process("emailpush.process", self._process)
 
     def _pause_processing(self) -> None:
         """Used by tests to temporarily pause processing of events.
@@ -227,8 +227,10 @@ class EmailPusher(Pusher):
                     self.timed_call = None
 
         if soonest_due_at is not None:
-            self.timed_call = self.hs.get_reactor().callLater(
-                self.seconds_until(soonest_due_at), self.on_timer
+            delay = self.seconds_until(soonest_due_at)
+            self.timed_call = self.hs.get_clock().call_later(
+                delay,
+                self.on_timer,
             )
 
     async def save_last_stream_ordering_and_success(

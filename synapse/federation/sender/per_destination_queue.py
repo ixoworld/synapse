@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Tupl
 import attr
 from prometheus_client import Counter
 
+from twisted.internet import defer
+
 from synapse.api.constants import EduTypes
 from synapse.api.errors import (
     FederationDeniedError,
@@ -40,8 +42,7 @@ from synapse.federation.units import Edu
 from synapse.handlers.presence import format_user_presence_state
 from synapse.logging import issue9533_logger
 from synapse.logging.opentracing import SynapseTags, set_tag
-from synapse.metrics import sent_transactions_counter
-from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.metrics import SERVER_NAME_LABEL, sent_transactions_counter
 from synapse.types import JsonDict, ReadReceipt
 from synapse.util.retryutils import NotRetryingDestination, get_retry_limiter
 from synapse.visibility import filter_events_for_server
@@ -56,13 +57,15 @@ logger = logging.getLogger(__name__)
 
 
 sent_edus_counter = Counter(
-    "synapse_federation_client_sent_edus", "Total number of EDUs successfully sent"
+    "synapse_federation_client_sent_edus",
+    "Total number of EDUs successfully sent",
+    labelnames=[SERVER_NAME_LABEL],
 )
 
 sent_edus_by_type = Counter(
     "synapse_federation_client_sent_edus_by_type",
     "Number of sent EDUs successfully sent, by event type",
-    ["type"],
+    labelnames=["type", SERVER_NAME_LABEL],
 )
 
 
@@ -77,6 +80,7 @@ MAX_PRESENCE_STATES_PER_EDU = 50
 class PerDestinationQueue:
     """
     Manages the per-destination transmission queues.
+    Runs until `shutdown()` is called on the queue.
 
     Args:
         hs
@@ -91,7 +95,8 @@ class PerDestinationQueue:
         transaction_manager: "synapse.federation.sender.TransactionManager",
         destination: str,
     ):
-        self._server_name = hs.hostname
+        self.server_name = hs.hostname
+        self._hs = hs
         self._clock = hs.get_clock()
         self._storage_controllers = hs.get_storage_controllers()
         self._store = hs.get_datastores().main
@@ -115,6 +120,8 @@ class PerDestinationQueue:
 
         self._destination = destination
         self.transmission_loop_running = False
+        self._transmission_loop_enabled = True
+        self.active_transmission_loop: Optional[defer.Deferred] = None
 
         # Flag to signal to any running transmission loop that there is new data
         # queued up to be sent.
@@ -129,6 +136,8 @@ class PerDestinationQueue:
 
         # The stream_ordering of the most recent PDU that was discarded due to
         # being in catch-up mode.
+        # Can be set to zero if no PDU has been discarded since the last time
+        # we queried for new PDUs during catch-up.
         self._catchup_last_skipped: int = 0
 
         # Cache of the last successfully-transmitted stream ordering for this
@@ -166,6 +175,20 @@ class PerDestinationQueue:
 
     def __str__(self) -> str:
         return "PerDestinationQueue[%s]" % self._destination
+
+    def shutdown(self) -> None:
+        """Instruct the queue to stop processing any further requests"""
+        self._transmission_loop_enabled = False
+        # The transaction manager must be shutdown before cancelling the active
+        # transmission loop. Otherwise the transmission loop can enter a new cycle of
+        # sleeping before retrying since the shutdown flag of the _transaction_manager
+        # hasn't been set yet.
+        self._transaction_manager.shutdown()
+        try:
+            if self.active_transmission_loop is not None:
+                self.active_transmission_loop.cancel()
+        except Exception:
+            pass
 
     def pending_pdu_count(self) -> int:
         return len(self._pending_pdus)
@@ -305,9 +328,13 @@ class PerDestinationQueue:
             )
             return
 
+        if not self._transmission_loop_enabled:
+            logger.warning("Shutdown has been requested. Not sending transaction")
+            return
+
         logger.debug("TX [%s] Starting transaction loop", self._destination)
 
-        run_as_background_process(
+        self.active_transmission_loop = self._hs.run_as_background_process(
             "federation_transaction_transmission_loop",
             self._transaction_transmission_loop,
         )
@@ -316,11 +343,16 @@ class PerDestinationQueue:
         pending_pdus: List[EventBase] = []
         try:
             self.transmission_loop_running = True
-
             # This will throw if we wouldn't retry. We do this here so we fail
             # quickly, but we will later check this again in the http client,
             # hence why we throw the result away.
-            await get_retry_limiter(self._destination, self._clock, self._store)
+            await get_retry_limiter(
+                destination=self._destination,
+                our_server_name=self.server_name,
+                hs=self._hs,
+                clock=self._clock,
+                store=self._store,
+            )
 
             if self._catching_up:
                 # we potentially need to catch-up first
@@ -329,7 +361,7 @@ class PerDestinationQueue:
                     # not caught up yet
                     return
 
-            while True:
+            while self._transmission_loop_enabled:
                 self._new_data_to_send = False
 
                 async with _TransactionQueueManager(self) as (
@@ -342,8 +374,8 @@ class PerDestinationQueue:
                         # If we've gotten told about new things to send during
                         # checking for things to send, we try looking again.
                         # Otherwise new PDUs or EDUs might arrive in the meantime,
-                        # but not get sent because we hold the
-                        # `transmission_loop_running` flag.
+                        # but not get sent because we currently have an
+                        # `_active_transmission_loop` running.
                         if self._new_data_to_send:
                             continue
                         else:
@@ -360,10 +392,17 @@ class PerDestinationQueue:
                         self._destination, pending_pdus, pending_edus
                     )
 
-                    sent_transactions_counter.inc()
-                    sent_edus_counter.inc(len(pending_edus))
+                    sent_transactions_counter.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).inc()
+                    sent_edus_counter.labels(
+                        **{SERVER_NAME_LABEL: self.server_name}
+                    ).inc(len(pending_edus))
                     for edu in pending_edus:
-                        sent_edus_by_type.labels(edu.edu_type).inc()
+                        sent_edus_by_type.labels(
+                            type=edu.edu_type,
+                            **{SERVER_NAME_LABEL: self.server_name},
+                        ).inc()
 
         except NotRetryingDestination as e:
             logger.debug(
@@ -425,6 +464,7 @@ class PerDestinationQueue:
                 )
         finally:
             # We want to be *very* sure we clear this after we stop processing
+            self.active_transmission_loop = None
             self.transmission_loop_running = False
 
     async def _catch_up_transmission_loop(self) -> None:
@@ -452,7 +492,7 @@ class PerDestinationQueue:
         last_successful_stream_ordering: int = _tmp_last_successful_stream_ordering
 
         # get at most 50 catchup room/PDUs
-        while True:
+        while self._transmission_loop_enabled:
             event_ids = await self._store.get_catch_up_room_event_ids(
                 self._destination, last_successful_stream_ordering
             )
@@ -462,8 +502,18 @@ class PerDestinationQueue:
                 # of a race condition, so we check that no new events have been
                 # skipped due to us being in catch-up mode
 
-                if self._catchup_last_skipped > last_successful_stream_ordering:
+                if (
+                    self._catchup_last_skipped != 0
+                    and self._catchup_last_skipped > last_successful_stream_ordering
+                ):
                     # another event has been skipped because we were in catch-up mode
+                    # As an exception to this case: we can hit this branch if the
+                    # room has been purged whilst we have been looping.
+                    # In that case we avoid hot-looping by resetting the 'catch-up skipped
+                    # PDU' flag.
+                    # Then if there is still no progress to be made at the next iteration,
+                    # we can exit catch-up mode.
+                    self._catchup_last_skipped = 0
                     continue
 
                 # we are done catching up!
@@ -554,7 +604,7 @@ class PerDestinationQueue:
                     new_pdus = await filter_events_for_server(
                         self._storage_controllers,
                         self._destination,
-                        self._server_name,
+                        self.server_name,
                         new_pdus,
                         redact=False,
                         filter_out_erased_senders=True,
@@ -578,7 +628,9 @@ class PerDestinationQueue:
                     self._destination, room_catchup_pdus, []
                 )
 
-                sent_transactions_counter.inc()
+                sent_transactions_counter.labels(
+                    **{SERVER_NAME_LABEL: self.server_name}
+                ).inc()
 
                 # We pulled this from the DB, so it'll be non-null
                 assert pdu.internal_metadata.stream_ordering
@@ -601,7 +653,7 @@ class PerDestinationQueue:
         # Send at most limit EDUs for receipts.
         for content in self._pending_receipt_edus[:limit]:
             yield Edu(
-                origin=self._server_name,
+                origin=self.server_name,
                 destination=self._destination,
                 edu_type=EduTypes.RECEIPT,
                 content=content,
@@ -627,7 +679,7 @@ class PerDestinationQueue:
         )
         edus = [
             Edu(
-                origin=self._server_name,
+                origin=self.server_name,
                 destination=self._destination,
                 edu_type=edu_type,
                 content=content,
@@ -654,7 +706,7 @@ class PerDestinationQueue:
 
         edus = [
             Edu(
-                origin=self._server_name,
+                origin=self.server_name,
                 destination=self._destination,
                 edu_type=EduTypes.DIRECT_TO_DEVICE,
                 content=content,
@@ -727,7 +779,7 @@ class _TransactionQueueManager:
 
             pending_edus.append(
                 Edu(
-                    origin=self.queue._server_name,
+                    origin=self.queue.server_name,
                     destination=self.queue._destination,
                     edu_type=EduTypes.PRESENCE,
                     content={"push": presence_to_add},

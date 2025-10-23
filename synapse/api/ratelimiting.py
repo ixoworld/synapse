@@ -26,7 +26,7 @@ from synapse.api.errors import LimitExceededError
 from synapse.config.ratelimiting import RatelimitSettings
 from synapse.storage.databases.main import DataStore
 from synapse.types import Requester
-from synapse.util import Clock
+from synapse.util.clock import Clock
 
 if TYPE_CHECKING:
     # To avoid circular imports:
@@ -338,12 +338,10 @@ class Ratelimiter:
         )
 
         if not allowed:
-            if pause:
-                await self.clock.sleep(pause)
-
             raise LimitExceededError(
                 limiter_name=self._limiter_name,
                 retry_after_ms=int(1000 * (time_allowed - time_now_s)),
+                pause=pause,
             )
 
 

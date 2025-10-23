@@ -19,7 +19,6 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union, cast
 
@@ -35,6 +34,9 @@ from synapse.storage.database import (
 )
 from synapse.storage.databases.main.sliding_sync import SlidingSyncStore
 from synapse.storage.databases.main.stats import UserSortOrder
+from synapse.storage.databases.main.thread_subscriptions import (
+    ThreadSubscriptionsWorkerStore,
+)
 from synapse.storage.engines import BaseDatabaseEngine
 from synapse.storage.types import Cursor
 from synapse.types import get_domain_from_id
@@ -141,6 +143,7 @@ class DataStore(
     SearchStore,
     TagsStore,
     AccountDataStore,
+    ThreadSubscriptionsWorkerStore,
     PushRulesWorkerStore,
     StreamWorkerStore,
     OpenIdStore,
@@ -298,8 +301,12 @@ class DataStore(
                 LEFT JOIN erased_users AS eu ON u.name = eu.user_id
                 LEFT JOIN (
                     SELECT user_id, MAX(last_seen) AS last_seen_ts
+                    FROM devices GROUP BY user_id
+                ) lsd ON u.name = lsd.user_id
+                LEFT JOIN (
+                    SELECT user_id, MAX(last_seen) AS last_seen_ts
                     FROM user_ips GROUP BY user_id
-                ) ls ON u.name = ls.user_id
+                ) lsi ON u.name = lsi.user_id
                 {where_clause}
                 """
             sql = "SELECT COUNT(*) as total_users " + sql_base
@@ -309,7 +316,8 @@ class DataStore(
             sql = f"""
                 SELECT name, user_type, is_guest, admin, deactivated, shadow_banned,
                 displayname, avatar_url, creation_ts * 1000 as creation_ts, approved,
-                eu.user_id is not null as erased, last_seen_ts, locked
+                eu.user_id is not null as erased,
+                COALESCE(lsd.last_seen_ts, lsi.last_seen_ts) as last_seen_ts, locked
                 {sql_base}
                 ORDER BY {order_by_column} {order}, u.name ASC
                 LIMIT ? OFFSET ?

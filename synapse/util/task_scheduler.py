@@ -27,12 +27,11 @@ from twisted.python.failure import Failure
 from synapse.logging.context import (
     ContextResourceUsage,
     LoggingContext,
+    PreserveLoggingContext,
     nested_logging_context,
-    set_current_context,
 )
-from synapse.metrics import LaterGauge
+from synapse.metrics import SERVER_NAME_LABEL, LaterGauge
 from synapse.metrics.background_process_metrics import (
-    run_as_background_process,
     wrap_as_background_process,
 )
 from synapse.types import JsonMapping, ScheduledTask, TaskStatus
@@ -42,6 +41,13 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+running_tasks_gauge = LaterGauge(
+    name="synapse_scheduler_running_tasks",
+    desc="The number of concurrent running tasks handled by the TaskScheduler",
+    labelnames=[SERVER_NAME_LABEL],
+)
 
 
 class TaskScheduler:
@@ -100,7 +106,8 @@ class TaskScheduler:
     OCCASIONAL_REPORT_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
 
     def __init__(self, hs: "HomeServer"):
-        self._hs = hs
+        self.hs = hs  # nb must be called this for @wrap_as_background_process
+        self.server_name = hs.hostname
         self._store = hs.get_datastores().main
         self._clock = hs.get_clock()
         self._running_tasks: Set[str] = set()
@@ -127,11 +134,9 @@ class TaskScheduler:
                 TaskScheduler.SCHEDULE_INTERVAL_MS,
             )
 
-        LaterGauge(
-            "synapse_scheduler_running_tasks",
-            "The number of concurrent running tasks handled by the TaskScheduler",
-            labels=None,
-            caller=lambda: len(self._running_tasks),
+        running_tasks_gauge.register_hook(
+            homeserver_instance_id=hs.get_instance_id(),
+            hook=lambda: {(self.server_name,): len(self._running_tasks)},
         )
 
     def register_action(
@@ -207,7 +212,7 @@ class TaskScheduler:
             if self._run_background_tasks:
                 self._launch_scheduled_tasks()
             else:
-                self._hs.get_replication_command_handler().send_new_active_task(task.id)
+                self.hs.get_replication_command_handler().send_new_active_task(task.id)
 
         return task.id
 
@@ -354,7 +359,7 @@ class TaskScheduler:
             finally:
                 self._launching_new_tasks = False
 
-        run_as_background_process("launch_scheduled_tasks", inner)
+        self.hs.run_as_background_process("launch_scheduled_tasks", inner)
 
     @wrap_as_background_process("clean_scheduled_tasks")
     async def _clean_scheduled_tasks(self) -> None:
@@ -417,14 +422,11 @@ class TaskScheduler:
             """
 
             current_time = self._clock.time()
-            calling_context = set_current_context(task_log_context)
-            try:
+            with PreserveLoggingContext(task_log_context):
                 usage = task_log_context.get_resource_usage()
                 TaskScheduler._log_task_usage(
                     "continuing", task, usage, current_time - start_time
                 )
-            finally:
-                set_current_context(calling_context)
 
         async def wrapper() -> None:
             with nested_logging_context(task.id) as log_context:
@@ -440,7 +442,8 @@ class TaskScheduler:
                 except Exception:
                     f = Failure()
                     logger.error(
-                        f"scheduled task {task.id} failed",
+                        "scheduled task %s failed",
+                        task.id,
                         exc_info=(f.type, f.value, f.getTracebackObject()),
                     )
                     status = TaskStatus.FAILED
@@ -464,7 +467,10 @@ class TaskScheduler:
                 occasional_status_call.stop()
 
             # Try launch a new task since we've finished with this one.
-            self._clock.call_later(0.1, self._launch_scheduled_tasks)
+            self._clock.call_later(
+                0.1,
+                self._launch_scheduled_tasks,
+            )
 
         if len(self._running_tasks) >= TaskScheduler.MAX_CONCURRENT_RUNNING_TASKS:
             return
@@ -473,8 +479,10 @@ class TaskScheduler:
             self._clock.time_msec()
             > task.timestamp + TaskScheduler.LAST_UPDATE_BEFORE_WARNING_MS
         ):
-            logger.warn(
-                f"Task {task.id} (action {task.action}) has seen no update for more than 24h and may be stuck"
+            logger.warning(
+                "Task %s (action %s) has seen no update for more than 24h and may be stuck",
+                task.id,
+                task.action,
             )
 
         if task.id in self._running_tasks:
@@ -482,4 +490,4 @@ class TaskScheduler:
 
         self._running_tasks.add(task.id)
         await self.update_task(task.id, status=TaskStatus.ACTIVE)
-        run_as_background_process(f"task-{task.action}", wrapper)
+        self.hs.run_as_background_process(f"task-{task.action}", wrapper)

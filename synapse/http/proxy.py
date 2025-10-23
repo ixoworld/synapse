@@ -106,7 +106,7 @@ class ProxyResource(_AsyncResource):
     isLeaf = True
 
     def __init__(self, reactor: ISynapseReactor, hs: "HomeServer"):
-        super().__init__(True)
+        super().__init__(hs.get_clock(), True)
 
         self.reactor = reactor
         self.agent = hs.get_federation_http_client().agent
@@ -161,12 +161,12 @@ class ProxyResource(_AsyncResource):
             bodyProducer=QuieterFileBodyProducer(request.content),
         )
         request_deferred = timeout_deferred(
-            request_deferred,
+            deferred=request_deferred,
             # This should be set longer than the timeout in `MatrixFederationHttpClient`
             # so that it has enough time to complete and pass us the data before we give
             # up.
             timeout=90,
-            reactor=self.reactor,
+            clock=self._clock,
         )
 
         response = await make_deferred_yieldable(request_deferred)

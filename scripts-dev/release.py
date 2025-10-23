@@ -36,11 +36,11 @@ from typing import Any, List, Match, Optional, Union
 
 import attr
 import click
-import commonmark
 import git
 from click.exceptions import ClickException
 from git import GitCommandError, Repo
 from github import BadCredentialsException, Github
+from markdown_it import MarkdownIt
 from packaging import version
 
 
@@ -639,7 +639,16 @@ def _notify(message: str) -> None:
 
 
 @cli.command()
-def merge_back() -> None:
+# Although this option is not used, allow it anyways. Otherwise the user will
+# receive an error when providing it, which is annoying as other commands accept
+# it.
+@click.option(
+    "--gh-token",
+    "_gh_token",
+    envvar=["GH_TOKEN", "GITHUB_TOKEN"],
+    required=False,
+)
+def merge_back(_gh_token: Optional[str]) -> None:
     _merge_back()
 
 
@@ -687,7 +696,16 @@ def _merge_back() -> None:
 
 
 @cli.command()
-def announce() -> None:
+# Although this option is not used, allow it anyways. Otherwise the user will
+# receive an error when providing it, which is annoying as other commands accept
+# it.
+@click.option(
+    "--gh-token",
+    "_gh_token",
+    envvar=["GH_TOKEN", "GITHUB_TOKEN"],
+    required=False,
+)
+def announce(_gh_token: Optional[str]) -> None:
     _announce()
 
 
@@ -851,7 +869,7 @@ def get_changes_for_version(wanted_version: version.Version) -> str:
 
     # First we parse the changelog so that we can split it into sections based
     # on the release headings.
-    ast = commonmark.Parser().parse(changes)
+    tokens = MarkdownIt().parse(changes)
 
     @attr.s(auto_attribs=True)
     class VersionSection:
@@ -862,19 +880,22 @@ def get_changes_for_version(wanted_version: version.Version) -> str:
         end_line: Optional[int] = None  # Is none if its the last entry
 
     headings: List[VersionSection] = []
-    for node, _ in ast.walker():
-        # We look for all text nodes that are in a level 1 heading.
-        if node.t != "text":
+    for i, token in enumerate(tokens):
+        # We look for level 1 headings (h1 tags).
+        if token.type != "heading_open" or token.tag != "h1":
             continue
 
-        if node.parent.t != "heading" or node.parent.level != 1:
-            continue
+        # The next token should be an inline token containing the heading text
+        if i + 1 < len(tokens) and tokens[i + 1].type == "inline":
+            heading_text = tokens[i + 1].content
+            # The map property contains [line_begin, line_end] (0-based)
+            start_line = token.map[0] if token.map else 0
 
-        # If we have a previous heading then we update its `end_line`.
-        if headings:
-            headings[-1].end_line = node.parent.sourcepos[0][0] - 1
+            # If we have a previous heading then we update its `end_line`.
+            if headings:
+                headings[-1].end_line = start_line
 
-        headings.append(VersionSection(node.literal, node.parent.sourcepos[0][0] - 1))
+            headings.append(VersionSection(heading_text, start_line))
 
     changes_by_line = changes.split("\n")
 

@@ -21,16 +21,28 @@
 
 import logging
 from collections import OrderedDict
-from typing import Any, Generic, Iterable, Literal, Optional, TypeVar, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Iterable,
+    Literal,
+    Optional,
+    TypeVar,
+    Union,
+    overload,
+)
 
 import attr
 
 from twisted.internet import defer
 
 from synapse.config import cache as cache_config
-from synapse.metrics.background_process_metrics import run_as_background_process
-from synapse.util import Clock
 from synapse.util.caches import EvictionReason, register_cache
+from synapse.util.clock import Clock
+
+if TYPE_CHECKING:
+    from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +58,10 @@ VT = TypeVar("VT")
 class ExpiringCache(Generic[KT, VT]):
     def __init__(
         self,
+        *,
         cache_name: str,
+        server_name: str,
+        hs: "HomeServer",
         clock: Clock,
         max_len: int = 0,
         expiry_ms: int = 0,
@@ -56,6 +71,8 @@ class ExpiringCache(Generic[KT, VT]):
         """
         Args:
             cache_name: Name of this cache, used for logging.
+            server_name: The homeserver name that this cache is associated
+                with (used to label the metric) (`hs.hostname`).
             clock
             max_len: Max size of dict. If the dict grows larger than this
                 then the oldest items get automatically evicted. Default is 0,
@@ -83,14 +100,19 @@ class ExpiringCache(Generic[KT, VT]):
 
         self.iterable = iterable
 
-        self.metrics = register_cache("expiring", cache_name, self)
+        self.metrics = register_cache(
+            cache_type="expiring",
+            cache_name=cache_name,
+            cache=self,
+            server_name=server_name,
+        )
 
         if not self._expiry_ms:
             # Don't bother starting the loop if things never expire
             return
 
         def f() -> "defer.Deferred[None]":
-            return run_as_background_process("prune_cache", self._prune_cache)
+            return hs.run_as_background_process("prune_cache", self._prune_cache)
 
         self._clock.looping_call(f, self._expiry_ms / 2)
 
