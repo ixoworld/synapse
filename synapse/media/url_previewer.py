@@ -28,7 +28,7 @@ import re
 import shutil
 import sys
 import traceback
-from typing import TYPE_CHECKING, BinaryIO, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, BinaryIO, Iterable
 from urllib.parse import urljoin, urlparse, urlsplit
 from urllib.request import urlopen
 
@@ -41,12 +41,17 @@ from synapse.api.errors import Codes, SynapseError
 from synapse.http.client import SimpleHttpClient
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.media._base import FileInfo, get_filename_from_headers
-from synapse.media.media_storage import MediaStorage, SHA256TransparentIOWriter
+from synapse.media.media_storage import (
+    MediaStorage,
+    QuarantinedMediaException,
+    SHA256TransparentIOWriter,
+)
 from synapse.media.oembed import OEmbedProvider
 from synapse.media.preview_html import decode_body, parse_html_to_open_graph
 from synapse.types import JsonDict, UserID
 from synapse.util.async_helpers import ObservableDeferred
 from synapse.util.caches.expiringcache import ExpiringCache
+from synapse.util.duration import Duration
 from synapse.util.json import json_encoder
 from synapse.util.stringutils import random_string
 
@@ -64,15 +69,39 @@ ONE_DAY = 24 * ONE_HOUR
 IMAGE_CACHE_EXPIRY_MS = 2 * ONE_DAY
 
 
+def _try_remove_parent_dirs(dirs: Iterable[str]) -> None:
+    """Attempt to remove the given chain of parent directories
+
+    Args:
+        dirs: The list of directory paths to delete, with children appearing
+            before their parents.
+    """
+    for dir in dirs:
+        try:
+            os.rmdir(dir)
+        except FileNotFoundError:
+            # Already deleted, continue with deleting the rest
+            pass
+        except OSError as e:
+            # Failed, skip deleting the rest of the parent dirs
+            if e.errno != errno.ENOTEMPTY:
+                logger.warning(
+                    "Failed to remove media directory while clearing url preview cache: %r: %s",
+                    dir,
+                    e,
+                )
+            break
+
+
 @attr.s(slots=True, frozen=True, auto_attribs=True)
 class DownloadResult:
     length: int
     uri: str
     response_code: int
     media_type: str
-    download_name: Optional[str]
+    download_name: str | None
     expires: int
-    etag: Optional[str]
+    etag: str | None
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -87,7 +116,7 @@ class MediaInfo:
     media_length: int
     # The media filename, according to the server. This is parsed from the
     # returned headers, if possible.
-    download_name: Optional[str]
+    download_name: str | None
     # The time of the preview.
     created_ts_ms: int
     # Information from the media storage provider about where the file is stored
@@ -101,7 +130,7 @@ class MediaInfo:
     # The timestamp (in milliseconds) of when this preview expires.
     expires: int
     # The ETag header of the response.
-    etag: Optional[str]
+    etag: str | None
 
 
 class UrlPreviewer:
@@ -208,7 +237,9 @@ class UrlPreviewer:
         )
 
         if self._worker_run_media_background_jobs:
-            self.clock.looping_call(self._start_expire_url_cache_data, 10 * 1000)
+            self.clock.looping_call(
+                self._start_expire_url_cache_data, Duration(seconds=10)
+            )
 
     async def preview(self, url: str, user: UserID, ts: int) -> bytes:
         # the in-memory cache:
@@ -268,7 +299,7 @@ class UrlPreviewer:
 
         # The number of milliseconds that the response should be considered valid.
         expiration_ms = media_info.expires
-        author_name: Optional[str] = None
+        author_name: str | None = None
 
         if _is_media(media_info.media_type):
             file_id = media_info.filesystem_id
@@ -291,16 +322,16 @@ class UrlPreviewer:
 
             # define our OG response for this media
         elif _is_html(media_info.media_type):
-            # TODO: somehow stop a big HTML tree from exploding synapse's RAM
+            # TODO: somehow stop a big HTML document from exploding synapse's RAM
 
             with open(media_info.filename, "rb") as file:
                 body = file.read()
 
-            tree = decode_body(body, media_info.uri, media_info.media_type)
-            if tree is not None:
+            soup = decode_body(body, media_info.uri)
+            if soup is not None:
                 # Check if this HTML document points to oEmbed information and
                 # defer to that.
-                oembed_url = self._oembed.autodiscover_from_html(tree)
+                oembed_url = self._oembed.autodiscover_from_html(soup)
                 og_from_oembed: JsonDict = {}
                 # Only download to the oEmbed URL if it is allowed.
                 if oembed_url:
@@ -326,12 +357,18 @@ class UrlPreviewer:
 
                 # Parse Open Graph information from the HTML in case the oEmbed
                 # response failed or is incomplete.
-                og_from_html = parse_html_to_open_graph(tree)
+                og_from_html = parse_html_to_open_graph(soup)
 
-                # Compile the Open Graph response by using the scraped
-                # information from the HTML and overlaying any information
-                # from the oEmbed response.
-                og = {**og_from_html, **og_from_oembed}
+                # Compile an Open Graph response by combining the oEmbed response
+                # and the information from the HTML, with information in the HTML
+                # preferred.
+                #
+                # The ordering here is intentional: certain websites (especially
+                # SPA JavaScript-based ones) including Mastodon and YouTube provide
+                # almost complete OpenGraph descriptions but only stubs for oEmbed,
+                # with further oEmbed information being populated with JavaScript,
+                # that Synapse won't execute.
+                og = og_from_oembed | og_from_html
 
                 await self._precache_image_url(user, media_info, og)
             else:
@@ -604,15 +641,20 @@ class UrlPreviewer:
             else:
                 download_result = await self._download_url(url, sha256writer.wrap())
 
+        sha256 = sha256writer.hexdigest()
+        if await self.store.get_is_hash_quarantined(sha256):
+            # The media matches something that has been quarantined. Rather than
+            # storing it (and handing the client an mxc:// URI that will always
+            # 404), throw the download away entirely and let the caller decide
+            # how to cope without it.
+            logger.warning(
+                "Discarding %s from URL preview as it matched existing quarantined media",
+                url,
+            )
+            self._delete_url_cache_file(file_id)
+            raise QuarantinedMediaException()
+
         try:
-            sha256 = sha256writer.hexdigest()
-            should_quarantine = await self.store.get_is_hash_quarantined(sha256)
-
-            if should_quarantine:
-                logger.warning(
-                    "Media has been automatically quarantined as it matched existing quarantined media"
-                )
-
             time_now_ms = self.clock.time_msec()
 
             await self.store.store_local_media(
@@ -624,14 +666,13 @@ class UrlPreviewer:
                 user_id=user,
                 url_cache=url,
                 sha256=sha256,
-                quarantined_by="system" if should_quarantine else None,
             )
 
         except Exception as e:
             logger.error("Error handling downloaded %s: %r", url, e)
-            # TODO: we really ought to delete the downloaded file in this
-            # case, since we won't have recorded it in the db, and will
-            # therefore not expire it.
+            # We won't have recorded the file in the db, and will
+            # therefore not expire it; delete it now.
+            self._delete_url_cache_file(file_id)
             raise
 
         return MediaInfo(
@@ -645,6 +686,28 @@ class UrlPreviewer:
             response_code=download_result.response_code,
             expires=download_result.expires,
             etag=download_result.etag,
+        )
+
+    def _delete_url_cache_file(self, file_id: str) -> None:
+        """Remove a file from the url cache directory, along with any parent
+        directories left empty by its removal.
+
+        Note that url cache files are never handed to the storage providers (see
+        `StorageProviderWrapper.store_file`), so the local file is the only copy.
+        """
+        fname = self.filepaths.url_cache_filepath(file_id)
+        try:
+            os.remove(fname)
+        except FileNotFoundError:
+            pass  # If the path doesn't exist, meh
+        except OSError as e:
+            logger.warning(
+                "Failed to remove media from url preview cache: %r: %s", fname, e
+            )
+            return
+
+        _try_remove_parent_dirs(
+            self.filepaths.url_cache_filepath_dirs_to_delete(file_id)
         )
 
     async def _precache_image_url(
@@ -705,7 +768,7 @@ class UrlPreviewer:
 
     async def _handle_oembed_response(
         self, url: str, media_info: MediaInfo, expiration_ms: int
-    ) -> Tuple[JsonDict, Optional[str], int]:
+    ) -> tuple[JsonDict, str | None, int]:
         """
         Parse the downloaded oEmbed info.
 
@@ -751,29 +814,6 @@ class UrlPreviewer:
 
         logger.debug("Running url preview cache expiry")
 
-        def try_remove_parent_dirs(dirs: Iterable[str]) -> None:
-            """Attempt to remove the given chain of parent directories
-
-            Args:
-                dirs: The list of directory paths to delete, with children appearing
-                    before their parents.
-            """
-            for dir in dirs:
-                try:
-                    os.rmdir(dir)
-                except FileNotFoundError:
-                    # Already deleted, continue with deleting the rest
-                    pass
-                except OSError as e:
-                    # Failed, skip deleting the rest of the parent dirs
-                    if e.errno != errno.ENOTEMPTY:
-                        logger.warning(
-                            "Failed to remove media directory while clearing url preview cache: %r: %s",
-                            dir,
-                            e,
-                        )
-                    break
-
         # First we delete expired url cache entries
         media_ids = await self.store.get_expired_url_cache(now)
 
@@ -795,7 +835,7 @@ class UrlPreviewer:
             removed_media.append(media_id)
 
             dirs = self.filepaths.url_cache_filepath_dirs_to_delete(media_id)
-            try_remove_parent_dirs(dirs)
+            _try_remove_parent_dirs(dirs)
 
         await self.store.delete_url_cache(removed_media)
 
@@ -827,7 +867,7 @@ class UrlPreviewer:
                 continue
 
             dirs = self.filepaths.url_cache_filepath_dirs_to_delete(media_id)
-            try_remove_parent_dirs(dirs)
+            _try_remove_parent_dirs(dirs)
 
             thumbnail_dir = self.filepaths.url_cache_thumbnail_directory(media_id)
             try:
@@ -845,7 +885,7 @@ class UrlPreviewer:
             dirs = self.filepaths.url_cache_thumbnail_dirs_to_delete(media_id)
             # Note that one of the directories to be deleted has already been
             # removed by the `rmtree` above.
-            try_remove_parent_dirs(dirs)
+            _try_remove_parent_dirs(dirs)
 
         await self.store.delete_url_cache_media(removed_media)
 

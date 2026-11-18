@@ -22,7 +22,7 @@
 
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING
 
 from synapse.api.errors import SynapseError
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
@@ -43,15 +43,12 @@ class ExperimentalFeature(str, Enum):
 
     MSC3881 = "msc3881"
     MSC3575 = "msc3575"
-    MSC4222 = "msc4222"
 
     def is_globally_enabled(self, config: "HomeServerConfig") -> bool:
         if self is ExperimentalFeature.MSC3881:
             return config.experimental.msc3881_enabled
         if self is ExperimentalFeature.MSC3575:
             return config.experimental.msc3575_enabled
-        if self is ExperimentalFeature.MSC4222:
-            return config.experimental.msc4222_enabled
 
         assert_never(self)
 
@@ -62,7 +59,7 @@ class ExperimentalFeaturesRestServlet(RestServlet):
     for a given user
     """
 
-    PATTERNS = admin_patterns("/experimental_features/(?P<user_id>[^/]*)")
+    PATTERNS = admin_patterns("/experimental_features/(?P<user_id>[^/]*)$")
 
     def __init__(self, hs: "HomeServer"):
         super().__init__()
@@ -74,7 +71,7 @@ class ExperimentalFeaturesRestServlet(RestServlet):
         self,
         request: SynapseRequest,
         user_id: str,
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         """
         List which features are enabled for a given user
         """
@@ -99,7 +96,7 @@ class ExperimentalFeaturesRestServlet(RestServlet):
 
     async def on_PUT(
         self, request: SynapseRequest, user_id: str
-    ) -> Tuple[HTTPStatus, Dict]:
+    ) -> tuple[HTTPStatus, dict]:
         """
         Enable or disable the provided features for the requester
         """

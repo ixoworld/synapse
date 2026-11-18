@@ -27,27 +27,30 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     AbstractSet,
+    Annotated,
     Any,
     ClassVar,
-    Dict,
-    List,
+    Final,
+    Iterator,
     Literal,
     Mapping,
     Match,
     MutableMapping,
     NoReturn,
     Optional,
-    Set,
-    Tuple,
-    Type,
+    Sequence,
     TypedDict,
     TypeVar,
     Union,
     overload,
 )
 
+import annotated_types
 import attr
+import pydantic_core.core_schema
 from immutabledict import immutabledict
+from pydantic import GetCoreSchemaHandler, StrictInt
+from pydantic_core import CoreSchema
 from signedjson.key import decode_verify_key_bytes
 from signedjson.types import VerifyKey
 from typing_extensions import Self
@@ -66,6 +69,7 @@ from twisted.internet.interfaces import (
 )
 
 from synapse.api.errors import Codes, SynapseError
+from synapse.synapse_rust.types import Requester
 from synapse.util.cancellation import cancellable
 from synapse.util.stringutils import parse_and_validate_server_name
 
@@ -75,7 +79,6 @@ if TYPE_CHECKING:
     from synapse.appservice.api import ApplicationService
     from synapse.events import EventBase
     from synapse.storage.databases.main import DataStore, PurgeEventsStore
-    from synapse.storage.databases.main.appservice import ApplicationServiceWorkerStore
     from synapse.storage.util.id_generators import MultiWriterIdGenerator
 
 
@@ -84,16 +87,16 @@ logger = logging.getLogger(__name__)
 # Define a state map type from type/state_key to T (usually an event ID or
 # event)
 T = TypeVar("T")
-StateKey = Tuple[str, str]
+StateKey = tuple[str, str]
 StateMap = Mapping[StateKey, T]
 MutableStateMap = MutableMapping[StateKey, T]
 
 # JSON types. These could be made stronger, but will do for now.
 # A "simple" (canonical) JSON value.
-SimpleJsonValue = Optional[Union[str, int, bool]]
-JsonValue = Union[List[SimpleJsonValue], Tuple[SimpleJsonValue, ...], SimpleJsonValue]
+SimpleJsonValue = str | int | bool | None
+JsonValue = list[SimpleJsonValue] | tuple[SimpleJsonValue, ...] | SimpleJsonValue
 # A JSON-serialisable dict.
-JsonDict = Dict[str, Any]
+JsonDict = dict[str, Any]
 # A JSON-serialisable mapping; roughly speaking an immutable JSONDict.
 # Useful when you have a TypedDict which isn't going to be mutated and you don't want
 # to cast to JsonDict everywhere.
@@ -101,17 +104,142 @@ JsonMapping = Mapping[str, Any]
 # A JSON-serialisable object.
 JsonSerializable = object
 
+StrictJsonValue = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    "StrictJsonList",
+    "StrictJsonDict",
+    "StrictJsonSequence",
+    "StrictJsonMapping",
+]
+"""
+Type that represents any valid JSON value, recursively.
+Does not fall back to `Any` at deeper levels, which makes it more safe than `JsonValue`.
+
+Can also represent immutable mapping and tuple types.
+(Not sure if we would be better splitting them out.)
+"""
+
+StrictJsonList = list["StrictJsonValue"]
+"""
+Type that represents a list of any valid JSON value.
+"""
+
+StrictJsonDict = dict[str, "StrictJsonValue"]
+"""
+Type that represents a dict with string keys (as per JSON) and values of any
+valid JSON type.
+Does not fall back to `Any` at deeper levels, which makes it more safe than `JsonDict`.
+"""
+
+StrictJsonSequence = Sequence["StrictJsonValue"]
+"""
+Like `StrictJsonList` but using a `Sequence` as the collection type.
+"""
+
+StrictJsonMapping = Mapping[str, "StrictJsonValue"]
+"""
+Like `StrictJsonDict` but using `Mapping` as the collection type.
+"""
+
 # Collection[str] that does not include str itself; str being a Sequence[str]
 # is very misleading and results in bugs.
 #
 # StrCollection is an unordered collection of strings. If ordering is important,
 # StrSequence can be used instead.
-StrCollection = Union[Tuple[str, ...], List[str], AbstractSet[str]]
+StrCollection = tuple[str, ...] | list[str] | AbstractSet[str]
 # Sequence[str] that does not include str itself; str being a Sequence[str]
 # is very misleading and results in bugs.
 #
 # Unlike StrCollection, StrSequence is an ordered collection of strings.
-StrSequence = Union[Tuple[str, ...], List[str]]
+StrSequence = tuple[str, ...] | list[str]
+
+
+class AbsentType(Enum):
+    """
+    Type of a sentinel to use as an alternative to `None`
+    for when we really mean 'absent' and not JSON null.
+
+    Generally suitable for distinguishing a default state from user-suppliable values.
+    Has no meaning on its own.
+
+    It is falsy (like None is), so shorthand forms like `x or 0` can be used.
+    """
+
+    # Making this an Enum member makes this compatible with type narrowing,
+    # meaning `x is not Absent` will narrow `x: int | AbsentType` to `x: int` etc.
+    _Absent = object()
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source_type: object, handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        """
+        This function is checked for and used by Pydantic when
+        attempting to deserialise/validate a field of this type.
+
+        As the `Absent` type has no valid value when deserialising
+        from JSON (as that's the point; `Absent` is a marker representing
+        a lack of any JSON value), we always reject any value.
+        Instead of deserialising from this type, we rely on the struct class
+        we are in having field defaults that provide an `Absent`, which does not
+        go through the JSON validation.
+
+        When validating Python, we accept the absent marker itself.
+        """
+
+        def _reject_from_json(v: object) -> "AbsentType":
+            """
+            Reject the JSON value, no matter what it is, since absent values
+            are meant to be ... absent, thus have nothing they can be deserialised
+            from.
+            """
+            raise ValueError("AbsentType cannot be deserialized from JSON")
+
+        # `json_or_python_schema` wrapper needed for Pydantic < 2.10
+        # but can be replaced with just the `is_instance_schema` after that version.
+        return pydantic_core.core_schema.json_or_python_schema(
+            json_schema=pydantic_core.core_schema.no_info_plain_validator_function(
+                _reject_from_json
+            ),
+            python_schema=pydantic_core.core_schema.is_instance_schema(cls),
+        )
+
+    def __bool__(self) -> Literal[False]:
+        return False
+
+    def __str__(self) -> str:
+        return "Absent"
+
+    def __repr__(self) -> str:
+        return "Absent"
+
+
+Absent: Final = AbsentType._Absent
+"""
+Sentinel to use as an alternative to `None`
+for when we really mean 'absent' and not JSON null.
+
+Generally suitable for distinguishing a default state from user-suppliable values.
+Has no meaning on its own.
+
+It is falsy (like None is), so shorthand forms like `x or 0` can be used.
+
+(Previously known as `Sentinel.UNSET_SENTINEL`.)
+"""
+
+
+NonNegativeStrictInt = Annotated[StrictInt, annotated_types.Ge(0)]
+"""A strict integer that must be greater than or equal to zero.
+
+Should be preferred in place of Pydantic's own (lax) NonNegativeInt,
+which will coerce strings to integers in a way that does not agree with
+the Matrix specification (and would risk backing us into a backward compatibility
+hole where we had to support input forms we didn't intend).
+"""
 
 
 # Note that this seems to require inheriting *directly* from Interface in order
@@ -143,91 +271,15 @@ class ISynapseReactor(
     """The interfaces necessary for Synapse to function."""
 
 
-@attr.s(frozen=True, slots=True, auto_attribs=True)
-class Requester:
-    """
-    Represents the user making a request
-
-    Attributes:
-        user:  id of the user making the request
-        access_token_id:  *ID* of the access token used for this request, or
-            None for appservices, guests, and tokens generated by the admin API
-        is_guest:  True if the user making this request is a guest user
-        shadow_banned:  True if the user making this request has been shadow-banned.
-        device_id:  device_id which was set at authentication time, or
-            None for appservices, guests, and tokens generated by the admin API
-        app_service:  the AS requesting on behalf of the user
-        authenticated_entity: The entity that authenticated when making the request.
-            This is different to the user_id when an admin user or the server is
-            "puppeting" the user.
-    """
-
-    user: "UserID"
-    access_token_id: Optional[int]
-    is_guest: bool
-    scope: Set[str]
-    shadow_banned: bool
-    device_id: Optional[str]
-    app_service: Optional["ApplicationService"]
-    authenticated_entity: str
-
-    def serialize(self) -> Dict[str, Any]:
-        """Converts self to a type that can be serialized as JSON, and then
-        deserialized by `deserialize`
-
-        Returns:
-            dict
-        """
-        return {
-            "user_id": self.user.to_string(),
-            "access_token_id": self.access_token_id,
-            "is_guest": self.is_guest,
-            "scope": list(self.scope),
-            "shadow_banned": self.shadow_banned,
-            "device_id": self.device_id,
-            "app_server_id": self.app_service.id if self.app_service else None,
-            "authenticated_entity": self.authenticated_entity,
-        }
-
-    @staticmethod
-    def deserialize(
-        store: "ApplicationServiceWorkerStore", input: Dict[str, Any]
-    ) -> "Requester":
-        """Converts a dict that was produced by `serialize` back into a
-        Requester.
-
-        Args:
-            store: Used to convert AS ID to AS object
-            input: A dict produced by `serialize`
-
-        Returns:
-            Requester
-        """
-        appservice = None
-        if input["app_server_id"]:
-            appservice = store.get_app_service_by_id(input["app_server_id"])
-
-        return Requester(
-            user=UserID.from_string(input["user_id"]),
-            access_token_id=input["access_token_id"],
-            is_guest=input["is_guest"],
-            scope=set(input.get("scope", [])),
-            shadow_banned=input["shadow_banned"],
-            device_id=input["device_id"],
-            app_service=appservice,
-            authenticated_entity=input["authenticated_entity"],
-        )
-
-
 def create_requester(
     user_id: Union[str, "UserID"],
-    access_token_id: Optional[int] = None,
+    access_token_id: int | None = None,
     is_guest: bool = False,
     scope: StrCollection = (),
     shadow_banned: bool = False,
-    device_id: Optional[str] = None,
+    device_id: str | None = None,
     app_service: Optional["ApplicationService"] = None,
-    authenticated_entity: Optional[str] = None,
+    authenticated_entity: str | None = None,
 ) -> Requester:
     """
     Create a new ``Requester`` object
@@ -263,7 +315,7 @@ def create_requester(
         scope,
         shadow_banned,
         device_id,
-        app_service,
+        app_service.id if app_service else None,
         authenticated_entity,
     )
 
@@ -305,11 +357,11 @@ class DomainSpecificString(metaclass=abc.ABCMeta):
     def __copy__(self: DS) -> DS:
         return self
 
-    def __deepcopy__(self: DS, memo: Dict[str, object]) -> DS:
+    def __deepcopy__(self: DS, memo: dict[str, object]) -> DS:
         return self
 
     @classmethod
-    def from_string(cls: Type[DS], s: str) -> DS:
+    def from_string(cls: type[DS], s: str) -> DS:
         """Parse the string given by 's' into a structure object."""
         if len(s) < 1 or s[0:1] != cls.SIGIL:
             raise SynapseError(
@@ -337,7 +389,7 @@ class DomainSpecificString(metaclass=abc.ABCMeta):
         return "%s%s:%s" % (self.SIGIL, self.localpart, self.domain)
 
     @classmethod
-    def is_valid(cls: Type[DS], s: str) -> bool:
+    def is_valid(cls: type[DS], s: str) -> bool:
         """Parses the input string and attempts to ensure it is valid."""
         # TODO: this does not reject an empty localpart or an overly-long string.
         # See https://spec.matrix.org/v1.2/appendices/#identifier-grammar
@@ -348,7 +400,7 @@ class DomainSpecificString(metaclass=abc.ABCMeta):
             # possible for invalid data to exist in room-state, etc.
             parse_and_validate_server_name(obj.domain)
             return True
-        except Exception:
+        except (SynapseError, ValueError):
             return False
 
     __repr__ = to_string
@@ -359,6 +411,29 @@ class UserID(DomainSpecificString):
     """Structure representing a user ID."""
 
     SIGIL = "@"
+
+    @classmethod
+    def is_valid_strict(cls, s: str) -> bool:
+        """
+        Parses the input string and attempts to ensure it is a valid and compliant user
+        ID according to https://spec.matrix.org/v1.19/appendices/#historical-user-ids.
+
+        This should be used with care: there are existing non-compliant user IDs in the
+        wild with empty or non-ASCII localparts, which will be rejected by this method.
+        """
+        if len(s.encode("utf-8")) > 255:
+            return False
+        try:
+            obj = cls.from_string(s)
+            if not is_compliant_user_id_localpart(obj.localpart):
+                return False
+            # Apply additional validation to the domain. This is only done
+            # during  is_valid (and not part of from_string) since it is
+            # possible for invalid data to exist in room-state, etc.
+            parse_and_validate_server_name(obj.domain)
+            return True
+        except (SynapseError, ValueError):
+            return False
 
 
 @attr.s(slots=True, frozen=True, repr=False)
@@ -390,10 +465,10 @@ class RoomID:
 
     SIGIL = "!"
     id: str
-    room_id_with_domain: Optional[RoomIdWithDomain]
+    room_id_with_domain: RoomIdWithDomain | None
 
     @classmethod
-    def is_valid(cls: Type["RoomID"], s: str) -> bool:
+    def is_valid(cls: type["RoomID"], s: str) -> bool:
         if ":" in s:
             return RoomIdWithDomain.is_valid(s)
         try:
@@ -402,7 +477,7 @@ class RoomID:
         except Exception:
             return False
 
-    def get_domain(self) -> Optional[str]:
+    def get_domain(self) -> str | None:
         if not self.room_id_with_domain:
             return None
         return self.room_id_with_domain.domain
@@ -415,7 +490,7 @@ class RoomID:
     __repr__ = to_string
 
     @classmethod
-    def from_string(cls: Type["RoomID"], s: str) -> "RoomID":
+    def from_string(cls: type["RoomID"], s: str) -> "RoomID":
         # sigil check
         if len(s) < 1 or s[0] != cls.SIGIL:
             raise SynapseError(
@@ -424,7 +499,7 @@ class RoomID:
                 Codes.INVALID_PARAM,
             )
 
-        room_id_with_domain: Optional[RoomIdWithDomain] = None
+        room_id_with_domain: RoomIdWithDomain | None = None
         if ":" in s:
             room_id_with_domain = RoomIdWithDomain.from_string(s)
         else:
@@ -458,17 +533,64 @@ GUEST_USER_ID_PATTERN = re.compile(r"^\d+$")
 
 
 def contains_invalid_mxid_characters(localpart: str) -> bool:
-    """Check for characters not allowed in an mxid or groupid localpart
+    """
+    Check for characters not allowed in a modern user ID localpart.
+
+    This is primarily used for new registrations and MUST NOT be used to validate
+    existing user IDs, as there are real users whose user IDs don't follow this
+    character set.
+
+    See https://spec.matrix.org/v1.17/appendices/#user-identifiers
 
     Args:
         localpart: the localpart to be checked
-        use_extended_character_set: True to use the extended allowed characters
-            from MSC4009.
 
     Returns:
         True if there are any naughty characters
     """
     return any(c not in MXID_LOCALPART_ALLOWED_CHARACTERS for c in localpart)
+
+
+def is_compliant_user_id_localpart(localpart: str) -> bool:
+    """
+    Validates that the given user ID localpart is within the "compliant" range,
+    i.e. not empty and all characters are between U+0021 and U+007E inclusive.
+    See https://spec.matrix.org/v1.19/appendices/#historical-user-ids
+
+    To check if a localpart is non-historical, use contains_invalid_mxid_characters instead.
+
+    This should be used with care: there are existing non-compliant user IDs in the
+    wild with empty or non-ASCII localparts, which will be rejected by this method.
+
+    Args:
+        localpart: the localpart to be checked
+
+    Returns:
+        True if the localpart is compliant, False otherwise
+    """
+    if not localpart:
+        return False
+    return all(0x21 <= ord(c) <= 0x7E for c in localpart)
+
+
+def is_compliant_user_id(user_id: str) -> bool:
+    """
+    Validates that the localpart of the given user ID is within the "compliant"
+    range. See `is_compliant_user_id_localpart`.
+
+    Unlike parsing the user ID with `UserID.from_string`, this never raises on a
+    malformed user ID.
+
+    Args:
+        user_id: the user ID to be checked
+
+    Returns:
+        True if the localpart of the user ID is compliant, False otherwise
+    """
+    if not user_id.startswith(UserID.SIGIL):
+        return False
+    localpart, _, _ = user_id[1:].partition(":")
+    return is_compliant_user_id_localpart(localpart)
 
 
 UPPER_CASE_PATTERN = re.compile(b"[A-Z_]")
@@ -492,7 +614,7 @@ NON_MXID_CHARACTER_PATTERN = re.compile(
 
 
 def map_username_to_mxid_localpart(
-    username: Union[str, bytes], case_sensitive: bool = False
+    username: str | bytes, case_sensitive: bool = False
 ) -> str:
     """Map a username onto a string suitable for a MXID
 
@@ -640,6 +762,9 @@ class AbstractMultiWriterStreamToken(metaclass=abc.ABCMeta):
 
     def bound_stream_token(self, max_stream: int) -> "Self":
         """Bound the stream positions to a maximum value"""
+        # Shortcut if we're already under the bound
+        if self.get_max_stream_pos() <= max_stream:
+            return self
 
         min_pos = min(self.stream, max_stream)
         return type(self)(
@@ -749,7 +874,7 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
     attributes, must be hashable.
     """
 
-    topological: Optional[int] = attr.ib(
+    topological: int | None = attr.ib(
         validator=attr.validators.optional(attr.validators.instance_of(int)),
         kw_only=True,
         default=None,
@@ -829,7 +954,7 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
 
         return super().copy_and_advance(other)
 
-    def as_historical_tuple(self) -> Tuple[int, int]:
+    def as_historical_tuple(self) -> tuple[int, int]:
         """Returns a tuple of `(topological, stream)` for historical tokens.
 
         Raises if not an historical token (i.e. doesn't have a topological part).
@@ -895,74 +1020,86 @@ class RoomStreamToken(AbstractMultiWriterStreamToken):
 
 @attr.s(frozen=True, slots=True, order=False)
 class MultiWriterStreamToken(AbstractMultiWriterStreamToken):
-    """A basic stream token class for streams that supports multiple writers."""
+    """
+    A basic stream token class for streams that supports multiple writers.
+
+    Serialised as either:
+        - the bare `stream` position (e.g. `42`); or
+        - if any writer is ahead of that position,
+          as `m{stream}~{id}.{pos}~{id}.{pos}...`, where:
+          each `id` is the writer's ID from the `instance_map` table
+          (see `DataStore.get_id_for_instance`)
+
+    For the latter (`m{}~{}.{}~...`) form, it is necessary to check the writer of a
+    given row to determine how it compares to the token.
+
+    See:
+        - `is_stream_position_in_range` for a single row
+        - `is_before_or_eq` for comparing two tokens
+        - `make_multiwriter_sharded_token_bounds_sql` for SQL
+            - and its companion `advance_multiwriter_sharded_token_after_partial_read`
+    """
 
     @classmethod
-    async def parse(cls, store: "DataStore", string: str) -> "MultiWriterStreamToken":
+    async def parse(cls, store: "DataStore", string: str) -> Self:
+        unresolved = UnresolvedMultiWriterStreamToken.parse(string)
+        return await cls.from_unresolved(store, unresolved)
+
+    @classmethod
+    async def from_unresolved(
+        cls, store: "DataStore", unresolved: "UnresolvedMultiWriterStreamToken"
+    ) -> Self:
         try:
-            if string[0].isdigit():
-                return cls(stream=int(string))
-            if string[0] == "m":
-                parts = string[1:].split("~")
-                stream = int(parts[0])
-
-                instance_map = {}
-                for part in parts[1:]:
-                    if not part:
-                        # Handle tokens of the form `m5~`, which were created by
-                        # a bug
-                        continue
-
-                    key, value = part.split(".")
-                    instance_id = int(key)
-                    pos = int(value)
-
-                    instance_name = await store.get_name_from_instance_id(instance_id)
-                    instance_map[instance_name] = pos
-
-                return cls(
-                    stream=stream,
-                    instance_map=immutabledict(instance_map),
-                )
+            return cls(
+                stream=unresolved.stream,
+                instance_map=immutabledict(
+                    {
+                        (await store.get_name_from_instance_id(instance_id)): pos
+                        for instance_id, pos in unresolved.instance_id_to_stream_pos.items()
+                    }
+                ),
+            )
         except CancelledError:
             raise
         except Exception:
             # We log an exception here as even though this *might* be a client
             # handing a bad token, its more likely that Synapse returned a bad
             # token (and we really want to catch those!).
+            # TODO(2026): reivilibre: I'm less convinced this makes sense nowadays.
             logger.exception("Failed to parse stream token: %r", string)
         raise SynapseError(400, "Invalid stream token %r" % (string,))
 
     async def to_string(self, store: "DataStore") -> str:
         """See class level docstring for information about the format."""
+        return (await self.to_unresolved(store)).to_string()
 
-        if self.instance_map:
-            entries = []
-            for name, pos in self.instance_map.items():
-                if pos <= self.stream:
-                    # Ignore instances who are below the minimum stream position
-                    # (we might know they've advanced without seeing a recent
-                    # write from them).
-                    continue
-
-                instance_id = await store.get_id_for_instance(name)
-                entries.append(f"{instance_id}.{pos}")
-
-            if entries:
-                encoded_map = "~".join(entries)
-                return f"m{self.stream}~{encoded_map}"
-            return str(self.stream)
-        else:
-            return str(self.stream)
+    async def to_unresolved(
+        self, store: "DataStore"
+    ) -> "UnresolvedMultiWriterStreamToken":
+        """
+        Converts this token to its unresolved form, so that it can be used without database access.
+        """
+        return UnresolvedMultiWriterStreamToken(
+            stream=self.stream,
+            instance_id_to_stream_pos=immutabledict(
+                {
+                    (await store.get_id_for_instance(instance_name)): pos
+                    for instance_name, pos in self.instance_map.items()
+                }
+            ),
+        )
 
     @staticmethod
     def is_stream_position_in_range(
         low: Optional["AbstractMultiWriterStreamToken"],
         high: Optional["AbstractMultiWriterStreamToken"],
-        instance_name: Optional[str],
+        instance_name: str | None,
         pos: int,
     ) -> bool:
-        """Checks if a given persisted position is between the two given tokens.
+        """
+        Checks if a given persisted position is between the two given tokens.
+
+        Bounds: low < (instance_name, pos) <= high
 
         If `instance_name` is None then the row was persisted before multi
         writer support.
@@ -995,6 +1132,91 @@ class MultiWriterStreamToken(AbstractMultiWriterStreamToken):
         )
 
 
+@attr.s(auto_attribs=True, frozen=True, slots=True, order=False)
+class UnresolvedMultiWriterStreamToken:
+    """
+    `MultiWriterStreamToken`, but unresolved raw form where the instance names are not available.
+    This unresolved form is suitable for (de)serialising without database access.
+    Converting to or from a `MultiWriterStreamToken` requires database access to resolve instance (worker) names.
+
+    Serialised as either:
+        - the bare `stream` position (e.g. `42`); or
+        - if any writer is ahead of that position,
+            as `m{stream}~{id}.{pos}~{id}.{pos}...`, where:
+            each `id` is the writer's ID from the `instance_map` table
+            (see `DataStore.get_id_for_instance`)
+    """
+
+    stream: int
+    """
+    The baseline stream position.
+
+    All stream facts with stream ID numerically lower than this are unconditionally before this token.
+    """
+
+    instance_id_to_stream_pos: Mapping[int, int] = immutabledict()
+    """
+    Positions by writing instance that are ahead of the baseline (`stream`) position.
+    """
+
+    @classmethod
+    def parse(cls, string: str) -> Self:
+        try:
+            if string[0].isdigit():
+                return cls(stream=int(string))
+            if string[0] == "m":
+                parts = string[1:].split("~")
+                stream = int(parts[0])
+                instance_id_to_stream_pos = {}
+
+                for part in parts[1:]:
+                    if not part:
+                        # Handle tokens of the form `m5~`, which were created by
+                        # a bug
+                        continue
+
+                    key, value = part.split(".")
+                    instance_id = int(key)
+                    pos = int(value)
+
+                    instance_id_to_stream_pos[instance_id] = pos
+
+                return cls(
+                    stream=stream,
+                    instance_id_to_stream_pos=immutabledict(instance_id_to_stream_pos),
+                )
+        except CancelledError:
+            raise
+        except Exception:
+            # We log an exception here as even though this *might* be a client
+            # handing a bad token, its more likely that Synapse returned a bad
+            # token (and we really want to catch those!).
+            # TODO(2026): reivilibre: I'm less convinced this makes sense nowadays.
+            logger.exception("Failed to parse stream token: %r", string)
+        raise SynapseError(400, "Invalid stream token %r" % (string,))
+
+    def to_string(self) -> str:
+        """See class level docstring for information about the format."""
+
+        if self.instance_id_to_stream_pos:
+            entries = []
+            for instance_id, pos in self.instance_id_to_stream_pos.items():
+                if pos <= self.stream:
+                    # Ignore instances who are below the minimum stream position
+                    # (we might know they've advanced without seeing a recent
+                    # write from them).
+                    continue
+
+                entries.append(f"{instance_id}.{pos}")
+
+            if entries:
+                encoded_map = "~".join(entries)
+                return f"m{self.stream}~{encoded_map}"
+            return str(self.stream)
+        else:
+            return str(self.stream)
+
+
 class StreamKeyType(Enum):
     """Known stream types.
 
@@ -1011,6 +1233,9 @@ class StreamKeyType(Enum):
     DEVICE_LIST = "device_list_key"
     UN_PARTIAL_STATED_ROOMS = "un_partial_stated_rooms_key"
     THREAD_SUBSCRIPTIONS = "thread_subscriptions_key"
+    STICKY_EVENTS = "sticky_events_key"
+    QUARANTINED_MEDIA = "quarantined_media_key"
+    PROFILE_UPDATES = "profile_updates_key"
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -1018,7 +1243,7 @@ class StreamToken:
     """A collection of keys joined together by underscores in the following
     order and which represent the position in their respective streams.
 
-    ex. `s2633508_17_338_6732159_1082514_541479_274711_265584_1_379_4242`
+    ex. `s2633508_17_338_6732159_1082514_541479_274711_265584_1_379_4242_4141_4343_4444`
         1. `room_key`: `s2633508` which is a `RoomStreamToken`
            - `RoomStreamToken`'s can also look like `t426-2633508` or `m56~2.58~3.59`
            - See the docstring for `RoomStreamToken` for more details.
@@ -1032,12 +1257,15 @@ class StreamToken:
         9. `groups_key`: `1` (note that this key is now unused)
         10. `un_partial_stated_rooms_key`: `379`
         11. `thread_subscriptions_key`: 4242
+        12. `sticky_events_key`: 4141
+        13. `quarantined_media_key`: 4343
+        14. `profile_updates_key`: 4444
 
     You can see how many of these keys correspond to the various
     fields in a "/sync" response:
     ```json
     {
-        "next_batch": "s12_4_0_1_1_1_1_4_1_1",
+        "next_batch": "s12_4_0_1_1_1_1_4_1_1_1_1_1",
         "presence": {
             "events": []
         },
@@ -1049,7 +1277,7 @@ class StreamToken:
                 "!QrZlfIDQLNLdZHqTnt:hs1": {
                     "timeline": {
                         "events": [],
-                        "prev_batch": "s10_4_0_1_1_1_1_4_1_1",
+                        "prev_batch": "s10_4_0_1_1_1_1_4_1_1_1_1_1",
                         "limited": false
                     },
                     "state": {
@@ -1091,6 +1319,13 @@ class StreamToken:
     groups_key: int
     un_partial_stated_rooms_key: int
     thread_subscriptions_key: int
+    sticky_events_key: MultiWriterStreamToken = attr.ib(
+        validator=attr.validators.instance_of(MultiWriterStreamToken)
+    )
+    quarantined_media_key: MultiWriterStreamToken = attr.ib(
+        validator=attr.validators.instance_of(MultiWriterStreamToken)
+    )
+    profile_updates_key: int
 
     _SEPARATOR = "_"
     START: ClassVar["StreamToken"]
@@ -1119,6 +1354,9 @@ class StreamToken:
                 groups_key,
                 un_partial_stated_rooms_key,
                 thread_subscriptions_key,
+                sticky_events_key,
+                quarantined_media_key,
+                profile_updates_key,
             ) = keys
 
             return cls(
@@ -1135,6 +1373,13 @@ class StreamToken:
                 groups_key=int(groups_key),
                 un_partial_stated_rooms_key=int(un_partial_stated_rooms_key),
                 thread_subscriptions_key=int(thread_subscriptions_key),
+                sticky_events_key=await MultiWriterStreamToken.parse(
+                    store, sticky_events_key
+                ),
+                quarantined_media_key=await MultiWriterStreamToken.parse(
+                    store, quarantined_media_key
+                ),
+                profile_updates_key=int(profile_updates_key),
             )
         except CancelledError:
             raise
@@ -1158,6 +1403,9 @@ class StreamToken:
                 str(self.groups_key),
                 str(self.un_partial_stated_rooms_key),
                 str(self.thread_subscriptions_key),
+                await self.sticky_events_key.to_string(store),
+                await self.quarantined_media_key.to_string(store),
+                str(self.profile_updates_key),
             ]
         )
 
@@ -1187,6 +1435,18 @@ class StreamToken:
                 self.device_list_key.copy_and_advance(new_value),
             )
             return new_token
+        elif key == StreamKeyType.QUARANTINED_MEDIA:
+            new_token = self.copy_and_replace(
+                StreamKeyType.QUARANTINED_MEDIA,
+                self.quarantined_media_key.copy_and_advance(new_value),
+            )
+            return new_token
+        elif key == StreamKeyType.STICKY_EVENTS:
+            new_token = self.copy_and_replace(
+                StreamKeyType.STICKY_EVENTS,
+                self.sticky_events_key.copy_and_advance(new_value),
+            )
+            return new_token
 
         new_token = self.copy_and_replace(key, new_value)
         new_id = new_token.get_field(key)
@@ -1209,6 +1469,8 @@ class StreamToken:
         key: Literal[
             StreamKeyType.RECEIPT,
             StreamKeyType.DEVICE_LIST,
+            StreamKeyType.QUARANTINED_MEDIA,
+            StreamKeyType.STICKY_EVENTS,
         ],
     ) -> MultiWriterStreamToken: ...
 
@@ -1223,34 +1485,37 @@ class StreamToken:
             StreamKeyType.TYPING,
             StreamKeyType.UN_PARTIAL_STATED_ROOMS,
             StreamKeyType.THREAD_SUBSCRIPTIONS,
+            StreamKeyType.PROFILE_UPDATES,
         ],
     ) -> int: ...
 
     @overload
     def get_field(
         self, key: StreamKeyType
-    ) -> Union[int, RoomStreamToken, MultiWriterStreamToken]: ...
+    ) -> int | RoomStreamToken | MultiWriterStreamToken: ...
 
     def get_field(
         self, key: StreamKeyType
-    ) -> Union[int, RoomStreamToken, MultiWriterStreamToken]:
+    ) -> int | RoomStreamToken | MultiWriterStreamToken:
         """Returns the stream ID for the given key."""
         return getattr(self, key.value)
 
-    def is_before_or_eq(self, other_token: "StreamToken") -> bool:
-        """Wether this token is before the other token, i.e. every constituent
-        part is before the other.
+    def _iter_fields_strictly_after_token(
+        self, other_token: "StreamToken"
+    ) -> Iterator[StreamKeyType]:
+        """The keys where `other_token` is behind this token.
 
-        Essentially it is `self <= other`.
+        A generator so that `is_before_or_eq` can stop at the first one.
 
-        Note: if `self.is_before_or_eq(other_token) is False` then that does not
-        imply that the reverse is True.
+        The typing key is never yielded. That stream is allowed to "reset", and
+        so comparisons don't really make sense as is.
+        TODO: Figure out a better way of tracking resets.
         """
 
         for _, key in StreamKeyType.__members__.items():
             if key == StreamKeyType.TYPING:
-                # Typing stream is allowed to "reset", and so comparisons don't
-                # really make sense as is.
+                # The typing key is never yielded. That stream is allowed to
+                # "reset", and so comparisons don't really make sense as is.
                 # TODO: Figure out a better way of tracking resets.
                 continue
 
@@ -1260,17 +1525,34 @@ class StreamToken:
             if isinstance(self_value, RoomStreamToken):
                 assert isinstance(other_value, RoomStreamToken)
                 if not self_value.is_before_or_eq(other_value):
-                    return False
+                    yield key
             elif isinstance(self_value, MultiWriterStreamToken):
                 assert isinstance(other_value, MultiWriterStreamToken)
                 if not self_value.is_before_or_eq(other_value):
-                    return False
+                    yield key
             else:
                 assert isinstance(other_value, int)
                 if self_value > other_value:
-                    return False
+                    yield key
 
-        return True
+    def fields_strictly_after_token(
+        self, other_token: "StreamToken"
+    ) -> list[StreamKeyType]:
+        """The keys where `other_token` is behind this token, i.e. the keys that
+        stop `self.is_before_or_eq(other_token)` from being True.
+        """
+        return list(self._iter_fields_strictly_after_token(other_token))
+
+    def is_before_or_eq(self, other_token: "StreamToken") -> bool:
+        """Whether this token is before the other token, i.e. every constituent
+        part is before the other.
+
+        Essentially it is `self <= other`.
+
+        Note: if `self.is_before_or_eq(other_token) is False` then that does not
+        imply that the reverse is True.
+        """
+        return next(self._iter_fields_strictly_after_token(other_token), None) is None
 
     def __str__(self) -> str:
         return (
@@ -1278,8 +1560,10 @@ class StreamToken:
             f"typing: {self.typing_key}, receipt: {self.receipt_key}, "
             f"account_data: {self.account_data_key}, push_rules: {self.push_rules_key}, "
             f"to_device: {self.to_device_key}, device_list: {self.device_list_key}, "
-            f"groups: {self.groups_key}, un_partial_stated_rooms: {self.un_partial_stated_rooms_key},"
-            f"thread_subscriptions: {self.thread_subscriptions_key})"
+            f"groups: {self.groups_key}, un_partial_stated_rooms: {self.un_partial_stated_rooms_key}, "
+            f"thread_subscriptions: {self.thread_subscriptions_key}, sticky_events: {self.sticky_events_key}, "
+            f"quarantined_media: {self.quarantined_media_key}, "
+            f"profile_updates: {self.profile_updates_key})"
         )
 
 
@@ -1295,6 +1579,9 @@ StreamToken.START = StreamToken(
     groups_key=0,
     un_partial_stated_rooms_key=0,
     thread_subscriptions_key=0,
+    sticky_events_key=MultiWriterStreamToken(stream=0),
+    quarantined_media_key=MultiWriterStreamToken(stream=0),
+    profile_updates_key=0,
 )
 
 
@@ -1399,8 +1686,8 @@ class PersistedEventPosition(PersistedPosition):
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
 class ThirdPartyInstanceID:
-    appservice_id: Optional[str]
-    network_id: Optional[str]
+    appservice_id: str | None
+    network_id: str | None
 
     # Deny iteration because it will bite you if you try to create a singleton
     # set by:
@@ -1412,7 +1699,7 @@ class ThirdPartyInstanceID:
     def __copy__(self) -> "ThirdPartyInstanceID":
         return self
 
-    def __deepcopy__(self, memo: Dict[str, object]) -> "ThirdPartyInstanceID":
+    def __deepcopy__(self, memo: dict[str, object]) -> "ThirdPartyInstanceID":
         return self
 
     @classmethod
@@ -1436,8 +1723,8 @@ class ReadReceipt:
     room_id: str
     receipt_type: str
     user_id: str
-    event_ids: List[str]
-    thread_id: Optional[str]
+    event_ids: list[str]
+    thread_id: str | None
     data: JsonDict
 
 
@@ -1459,8 +1746,8 @@ class DeviceListUpdates:
     # The latter happening only once, thus always giving you the same sets
     # across multiple DeviceListUpdates instances.
     # Also see: don't define mutable default arguments.
-    changed: Set[str] = attr.ib(factory=set)
-    left: Set[str] = attr.ib(factory=set)
+    changed: set[str] = attr.ib(factory=set)
+    left: set[str] = attr.ib(factory=set)
 
     def __bool__(self) -> bool:
         return bool(self.changed or self.left)
@@ -1468,7 +1755,7 @@ class DeviceListUpdates:
 
 def get_verify_key_from_cross_signing_key(
     key_info: Mapping[str, Any],
-) -> Tuple[str, VerifyKey]:
+) -> tuple[str, VerifyKey]:
     """Get the key ID and signedjson verify key from a cross-signing key dict
 
     Args:
@@ -1512,11 +1799,11 @@ class UserInfo:
     """
 
     user_id: UserID
-    appservice_id: Optional[int]
-    consent_server_notice_sent: Optional[str]
-    consent_version: Optional[str]
-    consent_ts: Optional[int]
-    user_type: Optional[str]
+    appservice_id: int | None
+    consent_server_notice_sent: str | None
+    consent_version: str | None
+    consent_ts: int | None
+    user_type: str | None
     creation_ts: int
     is_admin: bool
     is_deactivated: bool
@@ -1529,14 +1816,14 @@ class UserInfo:
 
 class UserProfile(TypedDict):
     user_id: str
-    display_name: Optional[str]
-    avatar_url: Optional[str]
+    display_name: str | None
+    avatar_url: str | None
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
 class RetentionPolicy:
-    min_lifetime: Optional[int] = None
-    max_lifetime: Optional[int] = None
+    min_lifetime: int | None = None
+    max_lifetime: int | None = None
 
 
 class TaskStatus(str, Enum):
@@ -1551,6 +1838,8 @@ class TaskStatus(str, Enum):
     COMPLETE = "complete"
     # Task is over and either returned a failed status, or had an exception
     FAILED = "failed"
+    # Task has been cancelled
+    CANCELLED = "cancelled"
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -1568,13 +1857,13 @@ class ScheduledTask:
     # In milliseconds since epoch in system time timezone, usually UTC.
     timestamp: int
     # Optionally bind a task to some resource id for easy retrieval
-    resource_id: Optional[str]
+    resource_id: str | None
     # Optional parameters that will be passed to the function ran by the task
-    params: Optional[JsonMapping]
+    params: JsonMapping | None
     # Optional result that can be updated by the running task
-    result: Optional[JsonMapping]
+    result: JsonMapping | None
     # Optional error that should be assigned a value when the status is FAILED
-    error: Optional[str]
+    error: str | None
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -1603,3 +1892,17 @@ class EventOrderings:
         stream = event.internal_metadata.stream_ordering
         assert stream is not None
         return EventOrderings(stream, event.depth)
+
+
+def unwrap(val: T | None) -> T:
+    """
+    Assert that a value is non-None.
+
+    Analogous to `Option<T>.unwrap` in Rust.
+
+    Useful as an inline alternative to `assert val is not None`,
+    e.g. in set comprehensions.
+    """
+
+    assert val is not None
+    return val

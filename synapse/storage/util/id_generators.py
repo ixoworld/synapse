@@ -28,23 +28,20 @@ from typing import (
     TYPE_CHECKING,
     AsyncContextManager,
     ContextManager,
-    Dict,
     Generic,
     Iterable,
-    List,
-    Optional,
     Sequence,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
     cast,
 )
 
 import attr
+from immutabledict import immutabledict
+from prometheus_client import Gauge
 from sortedcontainers import SortedList, SortedSet
 
+from synapse.logging import issue9533_logger
+from synapse.metrics import SERVER_NAME_LABEL
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.storage.database import (
     DatabasePool,
@@ -52,14 +49,25 @@ from synapse.storage.database import (
     LoggingTransaction,
     make_in_list_sql_clause,
 )
-from synapse.storage.engines import PostgresEngine
+from synapse.storage.engines import BaseDatabaseEngine, PostgresEngine, Sqlite3Engine
 from synapse.storage.types import Cursor
 from synapse.storage.util.sequence import build_sequence_generator
+from synapse.types import MultiWriterStreamToken
 
 if TYPE_CHECKING:
     from synapse.notifier import ReplicationNotifier
 
 logger = logging.getLogger(__name__)
+
+# We report the calculated current position as seen by this worker. Note that
+# this is always positive (even for negative streams like backfill) to make
+# monitoring/alerting easier.
+stream_current_position_gauge = Gauge(
+    "synapse_storage_stream_current_position",
+    "The stream's current position as this process sees it."
+    "Note, these are always positive, even for negative streams.",
+    labelnames=["stream_name", SERVER_NAME_LABEL],
+)
 
 
 T = TypeVar("T")
@@ -182,7 +190,8 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
     Uses a Postgres sequence to coordinate ID assignment, but positions of other
     writers will only get updated when `advance` is called (by replication).
 
-    Note: Only works with Postgres.
+    On SQLite, falls back to a single-writer implementation, which is fine because
+    Synapse only supports monolith mode when SQLite is the database driver.
 
     Warning: Streams using this generator start at ID 2, because ID 1 is always assumed
         to have been 'seen as persisted'.
@@ -223,9 +232,9 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         stream_name: str,
         server_name: str,
         instance_name: str,
-        tables: List[Tuple[str, str, str]],
+        tables: list[tuple[str, str, str]],
         sequence_name: str,
-        writers: List[str],
+        writers: list[str],
         positive: bool = True,
     ) -> None:
         self._db = db
@@ -237,13 +246,22 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         self._writers = writers
         self._return_factor = 1 if positive else -1
 
+        # The `instance_name` label is what separates one worker's metrics from
+        # another's when there are multiple Synapse workers for the same homeserver
+        # running in the same process. In production the scrape labels would do that
+        # too, but tests run several homeservers in one process.
+        self._current_position_gauge = stream_current_position_gauge.labels(
+            stream_name=stream_name,
+            **{SERVER_NAME_LABEL: server_name},
+        )
+
         # We lock as some functions may be called from DB threads.
         self._lock = threading.Lock()
 
         # Note: If we are a negative stream then we still store all the IDs as
         # positive to make life easier for us, and simply negate the IDs when we
         # return them.
-        self._current_positions: Dict[str, int] = {}
+        self._current_positions: dict[str, int] = {}
 
         # Set of local IDs that we're still processing. The current position
         # should be less than the minimum of this set (if not empty).
@@ -260,7 +278,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
 
         # Set of local IDs that we've processed that are larger than the current
         # position, due to there being smaller unpersisted IDs.
-        self._finished_ids: Set[int] = set()
+        self._finished_ids: set[int] = set()
 
         # We track the max position where we know everything before has been
         # persisted. This is done by a) looking at the min across all instances
@@ -281,7 +299,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         self._persisted_upto_position = (
             min(self._current_positions.values()) if self._current_positions else 1
         )
-        self._known_persisted_positions: List[int] = []
+        self._known_persisted_positions: list[int] = []
 
         # The maximum stream ID that we have seen been allocated across any writer.
         # Since this defaults to 1, this means that ID 1 is assumed to have already
@@ -345,10 +363,24 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             # position with the current minimum.
             self._current_positions[self._instance_name] = self._persisted_upto_position
 
+        with self._lock:
+            self._report_current_position()
+
+    def _report_current_position(self) -> None:
+        """Report the current position as a metric.
+
+        Must be called with `_lock` held.
+        """
+        assert self._lock.locked()
+
+        # Note that we always report this as a positive value, so we don't
+        # multiply by the `_return_factor`.
+        self._current_position_gauge.set(self._persisted_upto_position)
+
     def _load_current_ids(
         self,
         db_conn: LoggingDatabaseConnection,
-        tables: List[Tuple[str, str, str]],
+        tables: list[tuple[str, str, str]],
         sequence_name: str,
     ) -> None:
         cur = db_conn.cursor(txn_name="_load_current_ids")
@@ -439,7 +471,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
 
             self._persisted_upto_position = min_stream_id
 
-            rows: List[Tuple[str, int]] = []
+            rows: list[tuple[str, int]] = []
             for table, instance_column, id_column in tables:
                 sql = """
                     SELECT %(instance)s, %(id)s FROM %(table)s
@@ -453,13 +485,13 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                 cur.execute(sql, (min_stream_id * self._return_factor,))
 
                 # Cast safety: this corresponds to the types returned by the query above.
-                rows.extend(cast(Iterable[Tuple[str, int]], cur))
+                rows.extend(cast(Iterable[tuple[str, int]], cur))
 
             # Sort by stream_id (ascending, lowest -> highest) so that we handle
             # rows in order for each instance because we don't want to overwrite
             # the current_position of an instance to a lower stream ID than
             # we're actually at.
-            def sort_by_stream_id_key_func(row: Tuple[str, int]) -> int:
+            def sort_by_stream_id_key_func(row: tuple[str, int]) -> int:
                 (instance, stream_id) = row
                 # If `stream_id` is ever `None`, we will see a `TypeError: '<'
                 # not supported between instances of 'NoneType' and 'X'` error.
@@ -492,7 +524,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         stream_ids = self._load_next_mult_id_txn(txn, 1)
         return stream_ids[0]
 
-    def _load_next_mult_id_txn(self, txn: Cursor, n: int) -> List[int]:
+    def _load_next_mult_id_txn(self, txn: Cursor, n: int) -> list[int]:
         # We need to track that we've requested some more stream IDs, and what
         # the current max allocated stream ID is. This is to prevent a race
         # where we've been allocated stream IDs but they have not yet been added
@@ -529,7 +561,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             AsyncContextManager[int], _MultiWriterCtxManager(self, self._notifier)
         )
 
-    def get_next_mult(self, n: int) -> AsyncContextManager[List[int]]:
+    def get_next_mult(self, n: int) -> AsyncContextManager[list[int]]:
         # If we have a list of instances that are allowed to write to this
         # stream, make sure we're in it.
         if self._writers and self._instance_name not in self._writers:
@@ -537,12 +569,22 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
 
         # Cast safety: see get_next.
         return cast(
-            AsyncContextManager[List[int]],
+            AsyncContextManager[list[int]],
             _MultiWriterCtxManager(self, self._notifier, n),
         )
 
     def get_next_txn(self, txn: LoggingTransaction) -> int:
         """
+        Generate an ID for immediate use within a database transaction.
+
+        The ID will automatically be marked as finished at the end of the
+        database transaction, therefore the stream rows MUST be persisted
+        within the active transaction (MUST NOT be persisted in a later
+        transaction).
+
+        The replication notifier will automatically be notified when the
+        transaction ends successfully.
+
         Usage:
 
             stream_id = stream_id_gen.get_next_txn(txn)
@@ -578,8 +620,18 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
 
         return self._return_factor * next_id
 
-    def get_next_mult_txn(self, txn: LoggingTransaction, n: int) -> List[int]:
+    def get_next_mult_txn(self, txn: LoggingTransaction, n: int) -> list[int]:
         """
+        Generate multiple IDs for immediate use within a database transaction.
+
+        The IDs will automatically be marked as finished at the end of the
+        database transaction, therefore the stream rows MUST be persisted
+        within the active transaction (MUST NOT be persisted in a later
+        transaction).
+
+        The replication notifier will automatically be notified when the
+        transaction ends successfully.
+
         Usage:
 
             stream_id = stream_id_gen.get_next_txn(txn)
@@ -615,7 +667,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
 
         return [self._return_factor * next_id for next_id in next_ids]
 
-    def _mark_ids_as_finished(self, next_ids: List[int]) -> None:
+    def _mark_ids_as_finished(self, next_ids: list[int]) -> None:
         """These IDs have finished being processed so we should advance the
         current position if possible.
         """
@@ -624,7 +676,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             self._unfinished_ids.difference_update(next_ids)
             self._finished_ids.update(next_ids)
 
-            new_cur: Optional[int] = None
+            new_cur: int | None = None
 
             if self._unfinished_ids or self._in_flight_fetches:
                 # If there are unfinished IDs then the new position will be the
@@ -707,7 +759,7 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                 self._instance_name, self._persisted_upto_position
             )
 
-    def get_positions(self) -> Dict[str, int]:
+    def get_positions(self) -> dict[str, int]:
         """Get a copy of the current positon map.
 
         Note that this won't necessarily include all configured writers if some
@@ -760,6 +812,14 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
         # We move the current min position up if the minimum current positions
         # of all instances is higher (since by definition all positions less
         # that that have been persisted).
+        #
+        # If we are one of several writers, then we don't need to factor our own
+        # `_current_position` into `_persisted_upto_position` unless we have unfinished
+        # writes (since we know that any future write that happens locally will have
+        # a higher stream ID than any of the other writers' current positions). In other
+        # words, when we have no outstanding writes, then the new `_persisted_upto_position`
+        # can be the minimum of all *other* writers' current positions,
+        #
         our_current_position = self._current_positions.get(self._instance_name, 0)
         min_curr = min(
             (
@@ -769,7 +829,6 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
             ),
             default=our_current_position,
         )
-
         if our_current_position and (self._unfinished_ids or self._in_flight_fetches):
             min_curr = min(min_curr, our_current_position)
 
@@ -805,6 +864,26 @@ class MultiWriterIdGenerator(AbstractStreamIdGenerator):
                 # There was a gap in seen positions, so there is nothing more to
                 # do.
                 break
+
+        self._report_current_position()
+
+        # Hacky debug logging to attempt to trace https://github.com/element-hq/synapse/issues/19795.
+        # If this is the to-device stream, and we are a writer for that stream, log some stats
+        if (
+            issue9533_logger.isEnabledFor(logging.DEBUG)
+            and our_current_position > 0
+            and self._stream_name == "to_device"
+        ):
+            issue9533_logger.debug(
+                "stream_id=%i now persisted for stream=%s; _current_positions=%s _unfinished_ids=%s, _known_persisted_positions=%s _persisted_upto_position=%i min_curr=%i",
+                new_id,
+                self._stream_name,
+                self._current_positions,
+                self._unfinished_ids,
+                self._known_persisted_positions,
+                self._persisted_upto_position,
+                min_curr,
+            )
 
     def _update_stream_positions_table_txn(self, txn: Cursor) -> None:
         """Update the `stream_positions` table with newly persisted position."""
@@ -849,10 +928,10 @@ class _AsyncCtxManagerWrapper(Generic[T]):
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
-    ) -> Optional[bool]:
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
         return self.inner.__exit__(exc_type, exc, tb)
 
 
@@ -862,18 +941,48 @@ class _MultiWriterCtxManager:
 
     id_gen: MultiWriterIdGenerator
     notifier: "ReplicationNotifier"
-    multiple_ids: Optional[int] = None
-    stream_ids: List[int] = attr.Factory(list)
+    multiple_ids: int | None = None
+    stream_ids: list[int] = attr.Factory(list)
 
-    async def __aenter__(self) -> Union[int, List[int]]:
+    async def __aenter__(self) -> int | list[int]:
+        def _load(txn: LoggingTransaction) -> list[int]:
+            ids = self.id_gen._load_next_mult_id_txn(txn, self.multiple_ids or 1)
+            # Record the allocated IDs on the context manager as a side effect
+            # (rather than only via the return value), so that if this coroutine
+            # is cancelled after the transaction has committed we still know
+            # which IDs to release below.
+            self.stream_ids = ids
+            return ids
+
         # It's safe to run this in autocommit mode as fetching values from a
         # sequence ignores transaction semantics anyway.
-        self.stream_ids = await self.id_gen._db.runInteraction(
-            "_load_next_mult_id",
-            self.id_gen._load_next_mult_id_txn,
-            self.multiple_ids or 1,
-            db_autocommit=True,
-        )
+        try:
+            await self.id_gen._db.runInteraction(
+                "_load_next_mult_id",
+                _load,
+                db_autocommit=True,
+            )
+        except BaseException:
+            # We catch `BaseException` rather than `Exception`,
+            # because request cancellation surfaces here as exceptions that are
+            # not `Exception` subclasses: `asyncio.CancelledError`
+            # and `GeneratorExit` (raised when a paused coroutine is garbage
+            # collected).
+            #
+            # If we're interrupted (e.g. the enclosing request was cancelled)
+            # after the transaction allocated the IDs but before we returned,
+            # then `__aexit__` will never run, because Python only invokes it
+            # once `__aenter__` has returned. The allocated IDs would then be
+            # leaked into `_unfinished_ids` forever, permanently pinning the
+            # persisted stream position and, e.g., wedging presence.
+            #
+            # So mark them as finished here to unblock the position. This mirrors
+            # what `__aexit__` does on the failure path (marking the IDs finished
+            # and notifying replication, but not persisting a new position).
+            if self.stream_ids:
+                self.id_gen._mark_ids_as_finished(self.stream_ids)
+                self.notifier.notify_replication()
+            raise
 
         if self.multiple_ids is None:
             return self.stream_ids[0] * self.id_gen._return_factor
@@ -882,9 +991,9 @@ class _MultiWriterCtxManager:
 
     async def __aexit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
     ) -> bool:
         self.id_gen._mark_ids_as_finished(self.stream_ids)
 
@@ -912,3 +1021,198 @@ class _MultiWriterCtxManager:
             )
 
         return False
+
+
+def make_multiwriter_sharded_token_bounds_sql(
+    db_engine: BaseDatabaseEngine,
+    *,
+    stream_id_column: str,
+    instance_name_column: str,
+    from_token_exclusive: MultiWriterStreamToken,
+    to_token_inclusive: MultiWriterStreamToken,
+) -> tuple[str, Sequence[str | int]]:
+    """
+    Build an SQL clause that, in a multi-writer stream table,
+    matches the rows within the bounds of the `MultiWriterStreamToken` tokens provided.
+
+    Bounds: from_token_exclusive < ... <= to_token_inclusive
+
+    Arguments:
+        stream_id_column: the name of the `stream_id` column
+            Should be prefixed with the table name or alias
+            when used in a multi-table SELECT statement.
+        instance_name_column: the name of the `instance_name` column.
+            Should be prefixed with the table name or alias
+            when used in a multi-table SELECT statement.
+        from_token_exclusive:
+            MultiWriterStreamToken representing the highest position that has 'already been seen'.
+            Exclusive lower bound
+        to_token_inclusive:
+            MultiWriterStreamToken representing the highest position that has visible data.
+            Inclusive upper bound
+
+    Example:
+
+        make_multiwriter_sharded_token_bounds_sql(
+            stream_id_column="se.stream_id",
+            instance_name_column="se.instance_name",
+            # m5~1.8
+            from_token_exclusive=MultiWriterStreamToken(
+                stream=5, instance_map=immutabledict({"worker1": 8})
+            ),
+            # m10~2.14
+            to_token_inclusive=MultiWriterStreamToken(
+                stream=10, instance_map=immutabledict({"worker2": 14})
+            ),
+        )
+
+    gives:
+
+        (
+            5 < se.stream_id AND se.stream_id <= 14
+            AND NOT (se.instance_name = 'worker1' AND se.stream_id <= 8)
+            AND (
+                se.stream_id <= 10
+                OR (se.instance_name = 'worker2' AND se.stream_id <= 14)
+            )
+        )
+
+    which matches, for example:
+        - a `worker1` row at position 9 (past the 8 we had already read from
+            `worker1`, and within the 10 that is visible for every writer);
+        - a `worker2` row at position 12 (past 5, and `worker2` is
+            explicitly visible up to 14);
+    but not:
+        - a `worker1` row at position 7, which the `from` token says we have
+            already read;
+        - a `worker3` row at position 12, which is beyond the position that
+            is visible for writers other than `worker2`.
+
+    See also:
+        - `advance_multiwriter_sharded_token_after_partial_read` to create the next
+          `from_token_exclusive` after the result of reading a limited set of rows.
+    """
+
+    is_not_distinct_from = "IS NOT DISTINCT FROM"
+    if isinstance(db_engine, Sqlite3Engine):
+        # TODO(SQLite 3.39.0): Drop this compatibility code
+        # SQL standard `IS NOT DISTINCT FROM` was not introduced until 3.39.0
+        # https://sqlite.org/releaselog/3_39_0.html
+        is_not_distinct_from = "IS"
+
+    # The SQL we build will fundamentally consist of many clauses ANDed together.
+    #
+    # We start with an envelope delimited by the two outermost, writer-independent, bounds.
+    # We know everything before the lowest position of `from` and everything after the highest
+    # position of `to` must be out-of-bounds.
+    # This pair of bounds is the most likely to be index-friendly.
+    clauses = [f"? < {stream_id_column}", f"{stream_id_column} <= ?"]
+    values: list[int | str] = [
+        from_token_exclusive.stream,
+        to_token_inclusive.get_max_stream_pos(),
+    ]
+
+    # Now for every writer where we had already read further ahead than the baseline (lowest) position of `from`,
+    # we whittle away what we have already seen from the lower end of the envelope.
+    for instance_name, pos in from_token_exclusive.instance_map.items():
+        # We need `IS NOT DISTINCT FROM` (analogous to `=` but treats `NULL` as a known value)
+        # for legacy rows where `instance_name` is `NULL`, such as before the stream was sharded.
+        clauses.append(
+            f"NOT ({instance_name_column} {is_not_distinct_from} ? AND {stream_id_column} <= ?)"
+        )
+        values.extend((instance_name, pos))
+
+    # Now we need to restrict the upper end of the envelope to only include those rows where either:
+    # - the row is in a region where all writers' rows are visible; or
+    upper_or_clauses = [f"{stream_id_column} <= ?"]
+    upper_or_values: list[int | str] = [to_token_inclusive.stream]
+    # - the row's writer is explicitly visible ahead of the baseline (minimum) position
+    for instance_name, pos in to_token_inclusive.instance_map.items():
+        upper_or_clauses.append(
+            f"({instance_name_column} {is_not_distinct_from} ? AND {stream_id_column} <= ?)"
+        )
+        upper_or_values.extend((instance_name, pos))
+
+    clauses.append("( " + " OR ".join(upper_or_clauses) + " )")
+    values.extend(upper_or_values)
+
+    return "( " + " AND ".join(clauses) + " )", values
+
+
+def advance_multiwriter_sharded_token_after_partial_read(
+    *,
+    from_token_exclusive: MultiWriterStreamToken,
+    to_token_inclusive: MultiWriterStreamToken,
+    last_read_stream_id: int,
+) -> MultiWriterStreamToken:
+    """
+    Calculates the 'read up to' token after reading a limited number of rows
+    between two `MultiWriterStreamToken` bounds.
+    Pairs with `make_multiwriter_sharded_token_bounds_sql`.
+
+    The read operation MUST have been ordered by the stream ID, e.g.
+    using `ORDER BY stream_id`.
+
+    Caution:
+        For streams where one fact is represented by multiple rows with
+        the same `stream_id`, the ENTIRE fact corresponding to `last_read_stream_id`
+        MUST have been processed because this function won't help you 'pause'
+        in the middle of a fact.
+
+    Arguments:
+        from_token_exclusive: the exclusive lower bound the rows were read with.
+        to_token_inclusive: the inclusive upper bound the rows were read with.
+        last_read_stream_id: the `stream_id` of the last row that was read.
+
+    Returns:
+        A token that could be used as the `from_token_exclusive` for a subsequent
+        read, in order to continue reading rows in range.
+
+        The token represents the maximum 'read up to' position.
+        Rows with positions strictly above the token have not yet been read.
+    """
+    assert from_token_exclusive.stream < last_read_stream_id, "read was out of bounds"
+
+    # Calculate the new baseline position that we have read up to,
+    # which applies across all workers.
+    new_baseline = max(
+        # Must be at least as far as it was before (doesn't go backwards)
+        from_token_exclusive.stream,
+        min(
+            # Simple case: this is just `last_read_stream_id`,
+            # the `stream_id` of the last row we read.
+            last_read_stream_id,
+            # Complicated case: some writers may not have advanced to `last_read_stream_id` yet,
+            # so we have to cap off at the baseline 'to' position (`to_token_inclusive.stream`)
+            to_token_inclusive.stream,
+        ),
+    )
+
+    # Now consider whether any workers are ahead of the baseline.
+    # We do this by calculating the position of each relevant worker.
+    # (Relevant by virtue of being in either the `from` or `to` token.)
+    advanced_instance_map = {}
+    for instance_name in (
+        from_token_exclusive.instance_map.keys()
+        | to_token_inclusive.instance_map.keys()
+    ):
+        # Calculate the worker's position
+        worker_pos = max(
+            # Must be at least as far as it was before (doesn't go backwards)
+            from_token_exclusive.get_stream_pos_for_instance(instance_name),
+            # Then:
+            # - up to `last_read_stream_id`
+            # - unless its rows aren't visible yet, so cap off at the `to` position
+            # Either one of these cases will be at least as high as `new_baseline`.
+            min(
+                last_read_stream_id,
+                to_token_inclusive.get_stream_pos_for_instance(instance_name),
+            ),
+        )
+
+        if worker_pos > new_baseline:
+            advanced_instance_map[instance_name] = worker_pos
+
+    return MultiWriterStreamToken(
+        stream=new_baseline, instance_map=immutabledict(advanced_instance_map)
+    )

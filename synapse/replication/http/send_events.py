@@ -20,7 +20,7 @@
 #
 
 import logging
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING
 
 from twisted.web.server import Request
 
@@ -64,7 +64,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
 
         200 OK
 
-        { "stream_id": 12345, "event_id": "$abcdef..." }
+        { "stream_id": 12345, "event_id": "$abcdef...", "received_ts": 424242 }
 
     Responds with a 409 when a `PartialStateConflictError` is raised due to an event
     context that needs to be recomputed due to the un-partial stating of a room.
@@ -85,11 +85,11 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
 
     @staticmethod
     async def _serialize_payload(  # type: ignore[override]
-        events_and_context: List[EventPersistencePair],
+        events_and_context: list[EventPersistencePair],
         store: "DataStore",
         requester: Requester,
         ratelimit: bool,
-        extra_users: List[UserID],
+        extra_users: list[UserID],
     ) -> JsonDict:
         """
         Args:
@@ -122,7 +122,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
 
     async def _handle_request(  # type: ignore[override]
         self, request: Request, payload: JsonDict
-    ) -> Tuple[int, JsonDict]:
+    ) -> tuple[int, JsonDict]:
         with Measure(
             self.clock, name="repl_send_events_parse", server_name=self.server_name
         ):
@@ -141,9 +141,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
                 )
                 event.internal_metadata.outlier = event_payload["outlier"]
 
-                requester = Requester.deserialize(
-                    self.store, event_payload["requester"]
-                )
+                requester = Requester.deserialize(event_payload["requester"])
                 context = EventContext.deserialize(
                     self._storage_controllers, event_payload["context"]
                 )
@@ -173,6 +171,7 @@ class ReplicationSendEventsRestServlet(ReplicationEndpoint):
             200,
             {
                 "stream_id": last_event.internal_metadata.stream_ordering,
+                "received_ts": last_event.internal_metadata.received_ts,
                 "event_id": last_event.event_id,
             },
         )

@@ -31,7 +31,6 @@ class _BackgroundUpdates:
     INDEX_STREAM_ORDERING2_TS = "index_stream_ordering2_ts"
     REPLACE_STREAM_ORDERING_COLUMN = "replace_stream_ordering_column"
 
-    EVENT_EDGES_DROP_INVALID_ROWS = "event_edges_drop_invalid_rows"
     EVENT_EDGES_REPLACE_INDEX = "event_edges_replace_index"
 
     EVENTS_POPULATE_STATE_KEY_REJECTIONS = "events_populate_state_key_rejections"
@@ -64,3 +63,7 @@ class _BackgroundUpdates:
     )
 
     FIXUP_MAX_DEPTH_CAP = "fixup_max_depth_cap"
+
+    REDACTIONS_RECHECK_BG_UPDATE = "redactions_recheck"
+
+    EVENT_RESIGN = "event_resign"

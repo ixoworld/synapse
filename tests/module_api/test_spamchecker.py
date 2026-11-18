@@ -12,25 +12,40 @@
 # <https://www.gnu.org/licenses/agpl-3.0.html>.
 #
 #
-from typing import Literal, Union
+from http import HTTPStatus
+from typing import Literal
+
+from parameterized import parameterized
 
 from twisted.internet.testing import MemoryReactor
 
-from synapse.api.constants import EventContentFields, EventTypes
+from synapse.api.constants import (
+    EventContentFields,
+    EventTypes,
+    Membership,
+)
+from synapse.api.room_versions import RoomVersions
 from synapse.config.server import DEFAULT_ROOM_VERSION
-from synapse.rest import admin, login, room, room_upgrade_rest_servlet
+from synapse.events import make_event_from_dict
+from synapse.module_api import EventBase
+from synapse.rest import admin, delayed_events, login, room, room_upgrade_rest_servlet
 from synapse.server import HomeServer
 from synapse.types import Codes, JsonDict
 from synapse.util.clock import Clock
+from synapse.util.duration import Duration
 
+from tests import unittest
 from tests.server import FakeChannel
 from tests.unittest import HomeserverTestCase
 
 
 class SpamCheckerTestCase(HomeserverTestCase):
+    """Tests for the spam checker module API."""
+
     servlets = [
         room.register_servlets,
         admin.register_servlets,
+        delayed_events.register_servlets,
         login.register_servlets,
         room_upgrade_rest_servlet.register_servlets,
     ]
@@ -59,7 +74,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         async def user_may_create_room(
             user_id: str, room_config: JsonDict
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_room_config = room_config
             self.last_user_id = user_id
             return "NOT_SPAM"
@@ -82,7 +97,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         async def user_may_create_room(
             user_id: str, room_config: JsonDict
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_room_config = room_config
             self.last_user_id = user_id
             return "NOT_SPAM"
@@ -117,7 +132,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         async def user_may_create_room(
             user_id: str, room_config: JsonDict
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_room_config = room_config
             self.last_user_id = user_id
             return "NOT_SPAM"
@@ -156,7 +171,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         async def user_may_create_room(
             user_id: str, room_config: JsonDict
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_room_config = room_config
             self.last_user_id = user_id
             return Codes.UNAUTHORIZED
@@ -181,7 +196,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         async def user_may_create_room(
             user_id: str,
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_user_id = user_id
             return "NOT_SPAM"
 
@@ -205,7 +220,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
             event_type: str,
             state_key: str,
             content: JsonDict,
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             self.last_user_id = user_id
             self.last_room_id = room_id
             self.last_event_type = event_type
@@ -255,7 +270,7 @@ class SpamCheckerTestCase(HomeserverTestCase):
             event_type: str,
             state_key: str,
             content: JsonDict,
-        ) -> Union[Literal["NOT_SPAM"], Codes]:
+        ) -> Literal["NOT_SPAM"] | Codes:
             return Codes.FORBIDDEN
 
         self._module_api.register_spam_checker_callbacks(
@@ -284,3 +299,316 @@ class SpamCheckerTestCase(HomeserverTestCase):
 
         self.assertEqual(channel.code, 403)
         self.assertEqual(channel.json_body["errcode"], Codes.FORBIDDEN)
+
+    @parameterized.expand((False, True))
+    @unittest.override_config({"max_event_delay_duration": "24h"})
+    def test_user_may_send_state_event_with_delay(self, send_manually: bool) -> None:
+        """Test that the user_may_send_state_event callback is called when a delayed state event
+        is sent (not when it is scheduled), and that it receives the correct parameters.
+        """
+
+        async def user_may_send_state_event(
+            user_id: str,
+            room_id: str,
+            event_type: str,
+            state_key: str,
+            content: JsonDict,
+        ) -> Literal["NOT_SPAM"] | Codes:
+            self.did_spam_check = True
+            self.last_user_id = user_id
+            self.last_room_id = room_id
+            self.last_event_type = event_type
+            self.last_state_key = state_key
+            self.last_content = content
+            return "NOT_SPAM"
+
+        self._module_api.register_spam_checker_callbacks(
+            user_may_send_state_event=user_may_send_state_event
+        )
+        self.did_spam_check = False
+
+        channel = self.create_room({})
+
+        self.assertEqual(channel.code, 200)
+
+        room_id = channel.json_body["room_id"]
+
+        event_type = "test.event.type"
+        state_key = "test.state.key"
+        delay = Duration(seconds=10)
+        channel = self.make_request(
+            "PUT",
+            f"/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/mid",
+            content={
+                "delay_ms": delay.as_millis(),
+                "state_key": state_key,
+                "content": {"foo": "bar"},
+            },
+            access_token=self.token,
+        )
+
+        self.assertEqual(channel.code, 200)
+        self.assertFalse(self.did_spam_check)
+
+        delay_id = channel.json_body["delay_id"]
+
+        if send_manually:
+            channel = self.make_request(
+                "POST",
+                f"/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/send",
+                access_token=self.token,
+            )
+        else:
+            # Advance time enough so the delayed event is sent
+            self.reactor.advance(delay.as_secs())
+
+        self.assertEqual(channel.code, 200)
+        self.assertTrue(self.did_spam_check)
+        self.assertEqual(self.last_user_id, self.user_id)
+        self.assertEqual(self.last_room_id, room_id)
+        self.assertEqual(self.last_event_type, event_type)
+        self.assertEqual(self.last_state_key, state_key)
+        self.assertEqual(self.last_content, {"foo": "bar"})
+
+    @parameterized.expand((False, True))
+    @unittest.override_config({"max_event_delay_duration": "24h"})
+    def test_user_may_send_state_event_disallows_with_delay(
+        self, send_manually: bool
+    ) -> None:
+        """Test that the user_may_send_state_event callback is called when a delayed state event
+        is sent (not when it is scheduled), and that the response is honoured.
+        """
+
+        async def user_may_send_state_event(
+            user_id: str,
+            room_id: str,
+            event_type: str,
+            state_key: str,
+            content: JsonDict,
+        ) -> Literal["NOT_SPAM"] | Codes:
+            return Codes.FORBIDDEN
+
+        self._module_api.register_spam_checker_callbacks(
+            user_may_send_state_event=user_may_send_state_event
+        )
+        self.did_spam_check = False
+
+        channel = self.create_room({})
+
+        self.assertEqual(channel.code, 200)
+
+        room_id = channel.json_body["room_id"]
+
+        event_type = "test.event.type"
+        state_key = "test.state.key"
+        delay = Duration(seconds=10)
+        channel = self.make_request(
+            "PUT",
+            f"/_matrix/client/unstable/org.matrix.msc4140/rooms/{room_id}/delayed_event/{event_type}/mid",
+            content={
+                "delay_ms": delay.as_millis(),
+                "state_key": state_key,
+                "content": {"foo": "bar"},
+            },
+            access_token=self.token,
+        )
+
+        self.assertEqual(channel.code, 200)
+        self.assertFalse(self.did_spam_check)
+
+        delay_id = channel.json_body["delay_id"]
+
+        if send_manually:
+            channel = self.make_request(
+                "POST",
+                f"/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/send",
+                access_token=self.token,
+            )
+            self.assertEqual(channel.code, 403)
+            self.assertEqual(channel.json_body["errcode"], Codes.FORBIDDEN)
+        else:
+            # Advance time enough so the delayed event is sent
+            self.reactor.advance(delay.as_secs())
+
+        # The state should not have been set by the delayed event
+        channel = self.make_request(
+            "GET",
+            f"/_matrix/client/r0/rooms/{room_id}/state/{event_type}/{state_key}",
+            access_token=self.token,
+        )
+        self.assertEqual(channel.code, 404)
+
+
+class FederatedEventSpamCheckMetadataTestCase(unittest.FederatingHomeserverTestCase):
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        room.register_servlets,
+    ]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        super().prepare(reactor, clock, hs)
+        self._module_api = hs.get_module_api()
+        self._store = hs.get_datastores().main
+        self._storage_controllers = hs.get_storage_controllers()
+        self._federation_event_handler = hs.get_federation_event_handler()
+        self._federation_server = hs.get_federation_server()
+        self._state_handler = hs.get_state_handler()
+        self._persistence_controller = hs.get_storage_controllers().persistence
+
+        # Create a room
+        user1_id = self.register_user("user1", "pass")
+        user1_tok = self.login(user1_id, "pass")
+        self.room_id = self.helper.create_room_as(
+            user1_id,
+            tok=user1_tok,
+            is_public=True,
+            room_version=RoomVersions.V10.identifier,
+        )
+
+        # Prepare a join for the 'remote' user
+        state_map = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        forward_extremity_event_ids = self.get_success(
+            self.hs.get_datastores().main.get_latest_event_ids_in_room(self.room_id)
+        )
+        self.remote_user_id = f"@remoteuser:{self.OTHER_SERVER_NAME}"
+        self.remote_user_join_event = make_event_from_dict(
+            self.add_hashes_and_signatures_from_other_server(
+                {
+                    "room_id": self.room_id,
+                    "sender": self.remote_user_id,
+                    "state_key": self.remote_user_id,
+                    "depth": 1000,
+                    "origin_server_ts": 1,
+                    "type": EventTypes.Member,
+                    "content": {"membership": Membership.JOIN},
+                    "auth_events": [
+                        state_map[(EventTypes.Create, "")].event_id,
+                        state_map[(EventTypes.JoinRules, "")].event_id,
+                    ],
+                    "prev_events": list(forward_extremity_event_ids),
+                }
+            ),
+            room_version=RoomVersions.V10,
+        )
+
+        # Send the join
+        self.get_success(
+            self._federation_event_handler.on_receive_pdu(
+                self.OTHER_SERVER_NAME, self.remote_user_join_event
+            )
+        )
+
+        # Check the join made it to the 'local' view of the room
+        self.helper.get_event(
+            room_id=self.room_id,
+            event_id=self.remote_user_join_event.event_id,
+            tok=user1_tok,
+            expect_code=HTTPStatus.OK,
+        )
+
+    def test_federated_events_with_spam_checker_metadata(self) -> None:
+        """
+        Simulates receiving spammy and non-spammy events over federation,
+        then checks their `spam_checker_spammy` flag is set properly.
+        """
+
+        async def check_event_for_spam(event: EventBase) -> Literal["NOT_SPAM"] | Codes:
+            if event.type == EventTypes.Message:
+                if "ham" not in event.content["body"]:
+                    return Codes.FORBIDDEN
+            return "NOT_SPAM"
+
+        # Register a spam checker callback that only allows messages with 'ham'
+        self._module_api.register_spam_checker_callbacks(
+            check_event_for_spam=check_event_for_spam
+        )
+
+        # Prepare a spammy and a non-spammy event.
+        forward_extremity_event_ids = self.get_success(
+            self._store.get_latest_event_ids_in_room(self.room_id)
+        )
+        state_map = self.get_success(
+            self._storage_controllers.state.get_current_state(self.room_id)
+        )
+        spammy_event = make_event_from_dict(
+            self.add_hashes_and_signatures_from_other_server(
+                {
+                    "room_id": self.room_id,
+                    "sender": self.remote_user_id,
+                    "depth": 2000,
+                    "origin_server_ts": 2,
+                    "type": EventTypes.Message,
+                    "content": {"body": "this is spam", "msgtype": "m.text"},
+                    "auth_events": [
+                        state_map[(EventTypes.Create, "")].event_id,
+                        state_map[(EventTypes.JoinRules, "")].event_id,
+                        state_map[(EventTypes.Member, self.remote_user_id)].event_id,
+                    ],
+                    "prev_events": list(forward_extremity_event_ids),
+                }
+            ),
+            room_version=RoomVersions.V10,
+        )
+        non_spammy_event = make_event_from_dict(
+            self.add_hashes_and_signatures_from_other_server(
+                {
+                    "room_id": self.room_id,
+                    "sender": self.remote_user_id,
+                    "depth": 2000,
+                    "origin_server_ts": 2,
+                    "type": EventTypes.Message,
+                    "content": {"body": "delicious ham", "msgtype": "m.text"},
+                    "auth_events": [
+                        state_map[(EventTypes.Create, "")].event_id,
+                        state_map[(EventTypes.JoinRules, "")].event_id,
+                        state_map[(EventTypes.Member, self.remote_user_id)].event_id,
+                    ],
+                    "prev_events": list(forward_extremity_event_ids),
+                }
+            ),
+            room_version=RoomVersions.V10,
+        )
+
+        # Receive these events over federation
+        # We need to let the federation server have them because it will
+        # invoke `_check_sigs_and_hash` which invokes the spam checker.
+        self.get_success(
+            self._federation_server._handle_received_pdu(
+                self.OTHER_SERVER_NAME, spammy_event
+            )
+        )
+        self.get_success(
+            self._federation_server._handle_received_pdu(
+                self.OTHER_SERVER_NAME, non_spammy_event
+            )
+        )
+
+        # Retrieve the events from the database
+        retrieved_spammy_event = self.get_success(
+            self._store.get_event(spammy_event.event_id, allow_rejected=True)
+        )
+        retrieved_non_spammy_event = self.get_success(
+            self._store.get_event(non_spammy_event.event_id, allow_rejected=True)
+        )
+
+        # Assert the spammy flags (and soft-failed flags, for good measure) are set properly
+        self.assertTrue(
+            retrieved_spammy_event.internal_metadata.spam_checker_spammy,
+            "Spammy inbound event should be marked as spam_checker_spammy!",
+        )
+        self.assertTrue(
+            retrieved_spammy_event.internal_metadata.is_soft_failed(),
+            "Spammy inbound event should be soft-failed.",
+        )
+
+        self.assertFalse(
+            retrieved_non_spammy_event.internal_metadata.spam_checker_spammy,
+            "Non-spammy inbound event should not be marked as spam_checker_spammy!",
+        )
+        self.assertFalse(
+            retrieved_non_spammy_event.internal_metadata.is_soft_failed(),
+            "Non-spammy inbound event should not be soft-failed.",
+        )

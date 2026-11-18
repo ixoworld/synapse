@@ -18,21 +18,19 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import attr
 
 from synapse.api.errors import SynapseError, UnrecognizedRequestError
 from synapse.push.clientformat import format_push_rules_for_user
+from synapse.storage.databases.main.push_rule import filter_push_rules
 from synapse.storage.push_rule import RuleNotFoundException
-from synapse.synapse_rust.push import get_base_rule_ids
+from synapse.synapse_rust.push import PushRules
 from synapse.types import JsonDict, StreamKeyType, UserID
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
-
-
-BASE_RULE_IDS = get_base_rule_ids()
 
 
 @attr.s(slots=True, frozen=True, auto_attribs=True)
@@ -40,7 +38,7 @@ class RuleSpec:
     scope: str
     template: str
     rule_id: str
-    attr: Optional[str]
+    attr: str | None
 
 
 class PushRulesHandler:
@@ -50,8 +48,15 @@ class PushRulesHandler:
         self._notifier = hs.get_notifier()
         self._main_store = hs.get_datastores().main
 
+        self._served_default_rule_ids: frozenset[str] = frozenset(
+            rule.rule_id
+            for rule, _ in filter_push_rules(
+                PushRules([]), {}, hs.config.experimental
+            ).rules()
+        )
+
     async def set_rule_attr(
-        self, user_id: str, spec: RuleSpec, val: Union[bool, JsonDict]
+        self, user_id: str, spec: RuleSpec, val: bool | JsonDict
     ) -> None:
         """Set an attribute (enabled or actions) on an existing push rule.
 
@@ -63,7 +68,9 @@ class PushRulesHandler:
             val: the value to change the attribute to.
 
         Raises:
-            RuleNotFoundException if the rule being modified doesn't exist.
+            RuleNotFoundException if the rule being modified doesn't exist, or is a
+                server-default rule that is not served to the user (e.g. one gated
+                behind a disabled experimental feature).
             SynapseError(400) if the value is malformed.
             UnrecognizedRequestError if the attribute to change is unknown.
             InvalidRuleException if we're trying to change the actions on a rule but
@@ -79,7 +86,7 @@ class PushRulesHandler:
         rule_id = spec.rule_id
         is_default_rule = rule_id.startswith(".")
         if is_default_rule:
-            if namespaced_rule_id not in BASE_RULE_IDS:
+            if namespaced_rule_id not in self._served_default_rule_ids:
                 raise RuleNotFoundException("Unknown rule %r" % (namespaced_rule_id,))
         if spec.attr == "enabled":
             if isinstance(val, dict) and "enabled" in val:
@@ -99,13 +106,6 @@ class PushRulesHandler:
             if not isinstance(actions, list):
                 raise SynapseError(400, "Value for 'actions' must be dict")
             check_actions(actions)
-            rule_id = spec.rule_id
-            is_default_rule = rule_id.startswith(".")
-            if is_default_rule:
-                if namespaced_rule_id not in BASE_RULE_IDS:
-                    raise RuleNotFoundException(
-                        "Unknown rule %r" % (namespaced_rule_id,)
-                    )
             await self._main_store.set_push_rule_actions(
                 user_id, namespaced_rule_id, actions, is_default_rule
             )
@@ -127,7 +127,7 @@ class PushRulesHandler:
 
     async def push_rules_for_user(
         self, user: UserID
-    ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
         """
         Push rules aren't really account data, but get formatted as such for /sync.
         """
@@ -137,7 +137,7 @@ class PushRulesHandler:
         return rules
 
 
-def check_actions(actions: List[Union[str, JsonDict]]) -> None:
+def check_actions(actions: list[str | JsonDict]) -> None:
     """Check if the given actions are spec compliant.
 
     Args:

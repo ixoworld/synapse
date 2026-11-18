@@ -21,6 +21,19 @@ from tests.unittest import TestCase
 
 
 class ExplicitlyConfiguredLoggerTestCase(TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        # These tests mutate the root logger's level (see the various
+        # `root_logger.setLevel(...)` calls below). Make sure we restore the
+        # original level afterwards, otherwise we leak a raised log level into
+        # the other tests running in the same worker process. A raised level can
+        # cause oversized debug log lines which break `trial -jN` (worker log
+        # events are shipped to the manager over trials's AMP, which caps each
+        # value at 64KiB, c.f. https://github.com/twisted/twisted/issues/12482).
+        root_logger = logging.getLogger()
+        self.addCleanup(root_logger.setLevel, root_logger.level)
+
     def _create_explicitly_configured_logger(self) -> logging.Logger:
         original_logger_class = logging.getLoggerClass()
         logging.setLoggerClass(ExplicitlyConfiguredLogger)
@@ -40,7 +53,7 @@ class ExplicitlyConfiguredLoggerTestCase(TestCase):
 
         logger = self._create_explicitly_configured_logger()
 
-        with self.assertLogs(logger=logger, level=logging.NOTSET) as cm:
+        with self.assertNoLogs(logger=logger, level=logging.NOTSET):
             # XXX: We have to set this again because of a Python bug:
             # https://github.com/python/cpython/issues/136958 (feel free to remove once
             # that is resolved and we update to a newer Python version that includes the
@@ -51,20 +64,6 @@ class ExplicitlyConfiguredLoggerTestCase(TestCase):
             logger.info("info message")
             logger.warning("warning message")
             logger.error("error message")
-
-            # Nothing should be logged since the logger is *not* explicitly configured
-            #
-            # FIXME: Remove this whole block once we update to Python 3.10 or later and
-            # have access to `assertNoLogs` (replace `assertLogs` with `assertNoLogs`)
-            self.assertIncludes(
-                set(cm.output),
-                set(),
-                exact=True,
-            )
-            # Stub log message to avoid `assertLogs` failing since it expects at least
-            # one log message to be logged.
-            logger.setLevel(logging.INFO)
-            logger.info("stub message so `assertLogs` doesn't fail")
 
     def test_logs_when_explicitly_configured(self) -> None:
         """
