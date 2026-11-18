@@ -3,7 +3,10 @@
 //! Contains types and utilities for working with Matrix events.
 
 /// Maximum size of a PDU
-pub const MAX_PDU_SIZE_BYTES: usize = 65_536;
+///
+/// IXO: raised from upstream's 65_536 to 10 MiB to match `MAX_PDU_SIZE` in
+/// `synapse/api/constants.py` (large ai-oracle events). Keep the two in sync.
+pub const MAX_PDU_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Event Types
 pub mod event_type {
