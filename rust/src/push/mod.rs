@@ -59,7 +59,7 @@
 //! kind, etc, etc.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Error};
 use log::warn;
@@ -84,7 +84,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     child_module.add_class::<PushRules>()?;
     child_module.add_class::<FilteredPushRules>()?;
     child_module.add_class::<PushRuleEvaluator>()?;
-    child_module.add_function(wrap_pyfunction!(get_base_rule_ids, m)?)?;
 
     m.add_submodule(&child_module)?;
 
@@ -97,14 +96,9 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     Ok(())
 }
 
-#[pyfunction]
-fn get_base_rule_ids() -> HashSet<&'static str> {
-    base_rules::BASE_RULES_BY_ID.keys().copied().collect()
-}
-
 /// A single push rule for a user.
 #[derive(Debug, Clone)]
-#[pyclass(frozen)]
+#[pyclass(frozen, from_py_object)]
 pub struct PushRule {
     /// A unique ID for this rule
     pub rule_id: Cow<'static, str>,
@@ -273,14 +267,16 @@ pub enum SimpleJsonValue {
     Null,
 }
 
-impl<'source> FromPyObject<'source> for SimpleJsonValue {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
-        if let Ok(s) = ob.downcast::<PyString>() {
+impl<'source> FromPyObject<'_, 'source> for SimpleJsonValue {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'source, PyAny>) -> Result<Self, Self::Error> {
+        if let Ok(s) = ob.cast::<PyString>() {
             Ok(SimpleJsonValue::Str(Cow::Owned(s.to_string())))
         // A bool *is* an int, ensure we try bool first.
-        } else if let Ok(b) = ob.downcast::<PyBool>() {
+        } else if let Ok(b) = ob.cast::<PyBool>() {
             Ok(SimpleJsonValue::Bool(b.extract()?))
-        } else if let Ok(i) = ob.downcast::<PyInt>() {
+        } else if let Ok(i) = ob.cast::<PyInt>() {
             Ok(SimpleJsonValue::Int(i.extract()?))
         } else if ob.is_none() {
             Ok(SimpleJsonValue::Null)
@@ -301,12 +297,14 @@ pub enum JsonValue {
     Value(SimpleJsonValue),
 }
 
-impl<'source> FromPyObject<'source> for JsonValue {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
-        if let Ok(l) = ob.downcast::<PyList>() {
+impl<'source> FromPyObject<'_, 'source> for JsonValue {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'source, PyAny>) -> Result<Self, Self::Error> {
+        if let Ok(l) = ob.cast::<PyList>() {
             match l
                 .iter()
-                .map(|it| SimpleJsonValue::extract_bound(&it))
+                .map(|it| SimpleJsonValue::extract(it.as_borrowed()))
                 .collect()
             {
                 Ok(a) => Ok(JsonValue::Array(a)),
@@ -314,7 +312,7 @@ impl<'source> FromPyObject<'source> for JsonValue {
                     "Can't convert to JsonValue::Array: {e}"
                 ))),
             }
-        } else if let Ok(v) = SimpleJsonValue::extract_bound(ob) {
+        } else if let Ok(v) = SimpleJsonValue::extract(ob) {
             Ok(JsonValue::Value(v))
         } else {
             Err(PyTypeError::new_err(format!(
@@ -385,9 +383,11 @@ impl<'source> IntoPyObject<'source> for Condition {
     }
 }
 
-impl<'source> FromPyObject<'source> for Condition {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
-        Ok(depythonize(ob)?)
+impl<'source> FromPyObject<'_, 'source> for Condition {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'source, PyAny>) -> Result<Self, Self::Error> {
+        Ok(depythonize(&ob)?)
     }
 }
 
@@ -456,7 +456,7 @@ pub struct RelatedEventMatchTypeCondition {
 
 /// The collection of push rules for a user.
 #[derive(Debug, Clone, Default)]
-#[pyclass(frozen)]
+#[pyclass(frozen, from_py_object)]
 pub struct PushRules {
     /// Custom push rules that override a base rule.
     overridden_base_rules: HashMap<Cow<'static, str>, PushRule>,
@@ -543,7 +543,7 @@ impl PushRules {
 /// A wrapper around `PushRules` that checks the enabled state of rules and
 /// filters out disabled experimental rules.
 #[derive(Debug, Clone, Default)]
-#[pyclass(frozen)]
+#[pyclass(frozen, skip_from_py_object)]
 pub struct FilteredPushRules {
     push_rules: PushRules,
     enabled_map: BTreeMap<String, bool>,
@@ -551,6 +551,7 @@ pub struct FilteredPushRules {
     msc3381_polls_enabled: bool,
     msc3664_enabled: bool,
     msc4028_push_encrypted_events: bool,
+    msc4075_enabled: bool,
     msc4210_enabled: bool,
     msc4306_enabled: bool,
 }
@@ -566,6 +567,7 @@ impl FilteredPushRules {
         msc3381_polls_enabled: bool,
         msc3664_enabled: bool,
         msc4028_push_encrypted_events: bool,
+        msc4075_enabled: bool,
         msc4210_enabled: bool,
         msc4306_enabled: bool,
     ) -> Self {
@@ -576,6 +578,7 @@ impl FilteredPushRules {
             msc3381_polls_enabled,
             msc3664_enabled,
             msc4028_push_encrypted_events,
+            msc4075_enabled,
             msc4210_enabled,
             msc4306_enabled,
         }
@@ -616,6 +619,15 @@ impl FilteredPushRules {
 
                 if !self.msc4028_push_encrypted_events
                     && rule.rule_id == "global/override/.org.matrix.msc4028.encrypted_event"
+                {
+                    return false;
+                }
+
+                if !self.msc4075_enabled
+                    && (rule.rule_id
+                        == "global/override/.org.matrix.msc4075.rule.rtc.invite_for_me"
+                        || rule.rule_id
+                            == "global/override/.org.matrix.msc4075.rule.rtc.invite_for_room")
                 {
                     return false;
                 }

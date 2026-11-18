@@ -20,6 +20,18 @@ Please list changes below based of which ixo tag version the customization will 
 
 - Version bump with upstream changes.
 
+#### v1.165.0-ixo.1 (2026-11-18)
+
+- Version bump with upstream changes (merge of tag `v1.165.0`).
+- Kept `MAX_PDU_SIZE = 10 * 1024 * 1024` in `synapse/api/constants.py` (upstream now also derives `MAX_REQUEST_SIZE = 200 * MAX_PDU_SIZE` there).
+- Set the new Rust constant `MAX_PDU_SIZE_BYTES` in `rust/src/events/constants.rs` to 10 MiB as well (unused upstream in 1.165.0), so a later release that starts enforcing it cannot silently bring back the 64 KiB limit.
+- Image built from tag `v1.165.0-ixo`:
+
+```bash
+DOCKER_BUILDKIT=1 docker build --platform=linux/amd64 -f docker/Dockerfile -t ghcr.io/ixoworld/synapse:v1.165.0-ixo.1 .
+docker push ghcr.io/ixoworld/synapse:v1.165.0-ixo.1
+```
+
 ## Contributing
 
 Below are the steps to contribute to Ixo Synapse with your own custom configurations, or to update the existing code with latest upstream changes.

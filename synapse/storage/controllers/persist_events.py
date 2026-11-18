@@ -31,17 +31,11 @@ from typing import (
     Callable,
     ClassVar,
     Collection,
-    Deque,
-    Dict,
     Generator,
     Generic,
     Iterable,
-    List,
-    Optional,
-    Set,
-    Tuple,
+    Sequence,
     TypeVar,
-    Union,
 )
 
 import attr
@@ -50,7 +44,16 @@ from prometheus_client import Counter, Histogram
 from twisted.internet import defer
 
 from synapse.api.constants import EventTypes, Membership
-from synapse.events import EventBase
+from synapse.api.errors import SynapseError
+from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+from synapse.events import (
+    EventBase,
+    event_exists_in_state_dag,
+)
+from synapse.events.py_protocol import (
+    MSC4242Event,
+    all_supports_msc4242_state_dag,
+)
 from synapse.events.snapshot import EventContext, EventPersistencePair
 from synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME
 from synapse.logging.context import PreserveLoggingContext, make_deferred_yieldable
@@ -75,6 +78,7 @@ from synapse.types import (
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import ObservableDeferred, yieldable_gather_results
 from synapse.util.metrics import Measure
+from synapse.util.stringutils import shortstr
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -118,6 +122,14 @@ stale_forward_extremities_counter = Histogram(
     buckets=(0, 1, 2, 3, 5, 7, 10, 15, 20, 50, 100, 200, 500, "+Inf"),
 )
 
+# The number of forward extremities for each new event.
+msc4242_state_dag_forward_extremities_counter = Histogram(
+    "synapse_storage_msc4242_state_dag_forward_extremities_persisted",
+    "Number of forward extremities for each new event in the state DAG",
+    labelnames=[SERVER_NAME_LABEL],
+    buckets=(1, 2, 3, 5, 7, 10, 15, 20, 50, 100, 200, 500, "+Inf"),
+)
+
 state_resolutions_during_persistence = Counter(
     "synapse_storage_events_state_resolutions_during_persistence",
     "Number of times we had to do state res to calculate new current state",
@@ -143,7 +155,7 @@ class _PersistEventsTask:
 
     name: ClassVar[str] = "persist_event_batch"  # used for opentracing
 
-    events_and_contexts: List[EventPersistencePair]
+    events_and_contexts: list[EventPersistencePair]
     backfilled: bool
 
     def try_merge(self, task: "_EventPersistQueueTask") -> bool:
@@ -169,7 +181,7 @@ class _UpdateCurrentStateTask:
         return isinstance(task, _UpdateCurrentStateTask)
 
 
-_EventPersistQueueTask = Union[_PersistEventsTask, _UpdateCurrentStateTask]
+_EventPersistQueueTask = _PersistEventsTask | _UpdateCurrentStateTask
 _PersistResult = TypeVar("_PersistResult")
 
 
@@ -178,7 +190,7 @@ class _EventPersistQueueItem(Generic[_PersistResult]):
     task: _EventPersistQueueTask
     deferred: ObservableDeferred[_PersistResult]
 
-    parent_opentracing_span_contexts: List = attr.ib(factory=list)
+    parent_opentracing_span_contexts: list = attr.ib(factory=list)
     """A list of opentracing spans waiting for this batch"""
 
     opentracing_span_context: Any = None
@@ -208,8 +220,8 @@ class _EventPeristenceQueue(Generic[_PersistResult]):
         """
         self.server_name = server_name
         self.hs = hs
-        self._event_persist_queues: Dict[str, Deque[_EventPersistQueueItem]] = {}
-        self._currently_persisting_rooms: Set[str] = set()
+        self._event_persist_queues: dict[str, deque[_EventPersistQueueItem]] = {}
+        self._currently_persisting_rooms: set[str] = set()
         self._per_item_callback = per_item_callback
 
     async def add_to_queue(
@@ -365,7 +377,7 @@ class EventsPersistenceStorageController:
         self,
         room_id: str,
         task: _EventPersistQueueTask,
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Callback for the _event_persist_queue
 
         Returns:
@@ -394,7 +406,7 @@ class EventsPersistenceStorageController:
         self,
         events_and_contexts: Iterable[EventPersistencePair],
         backfilled: bool = False,
-    ) -> Tuple[List[EventBase], RoomStreamToken]:
+    ) -> tuple[list[EventBase], RoomStreamToken]:
         """
         Write events to the database
         Args:
@@ -414,8 +426,8 @@ class EventsPersistenceStorageController:
             PartialStateConflictError: if attempting to persist a partial state event in
                 a room that has been un-partial stated.
         """
-        event_ids: List[str] = []
-        partitioned: Dict[str, List[EventPersistencePair]] = {}
+        event_ids: list[str] = []
+        partitioned: dict[str, list[EventPersistencePair]] = {}
         for event, ctx in events_and_contexts:
             partitioned.setdefault(event.room_id, []).append((event, ctx))
             event_ids.append(event.event_id)
@@ -431,8 +443,8 @@ class EventsPersistenceStorageController:
         set_tag(SynapseTags.FUNC_ARG_PREFIX + "backfilled", str(backfilled))
 
         async def enqueue(
-            item: Tuple[str, List[EventPersistencePair]],
-        ) -> Dict[str, str]:
+            item: tuple[str, list[EventPersistencePair]],
+        ) -> dict[str, str]:
             room_id, evs_ctxs = item
             return await self._event_persist_queue.add_to_queue(
                 room_id,
@@ -447,7 +459,7 @@ class EventsPersistenceStorageController:
         #
         # Since we use `yieldable_gather_results` we need to merge the returned list
         # of dicts into one.
-        replaced_events: Dict[str, str] = {}
+        replaced_events: dict[str, str] = {}
         for d in ret_vals:
             replaced_events.update(d)
 
@@ -469,7 +481,7 @@ class EventsPersistenceStorageController:
     @trace
     async def persist_event(
         self, event: EventBase, context: EventContext, backfilled: bool = False
-    ) -> Tuple[EventBase, PersistedEventPosition, RoomStreamToken]:
+    ) -> tuple[EventBase, PersistedEventPosition, RoomStreamToken]:
         """
         Returns:
             The event, stream ordering of `event`, and the stream ordering of the
@@ -536,7 +548,15 @@ class EventsPersistenceStorageController:
         Returns:
             map from (type, state_key) to event id for the  current state in the room
         """
-        latest_event_ids = await self.main_store.get_latest_event_ids_in_room(room_id)
+        room_version = await self.main_store.get_room_version_id(room_id)
+        room_version_obj = KNOWN_ROOM_VERSIONS[room_version]
+        if room_version_obj.msc4242_state_dags:
+            latest_event_ids = await self.main_store.get_state_dag_extremities(room_id)
+        else:
+            latest_event_ids = await self.main_store.get_latest_event_ids_in_room(
+                room_id
+            )
+
         state_groups = set(
             (
                 await self.main_store._get_state_group_for_events(latest_event_ids)
@@ -558,7 +578,6 @@ class EventsPersistenceStorageController:
         # Avoid a circular import.
         from synapse.state import StateResolutionStore
 
-        room_version = await self.main_store.get_room_version_id(room_id)
         res = await self._state_resolution_handler.resolve_state_groups(
             room_id,
             room_version,
@@ -573,7 +592,7 @@ class EventsPersistenceStorageController:
 
     async def _persist_event_batch(
         self, room_id: str, task: _PersistEventsTask
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Callback for the _event_persist_queue
 
         Calculates the change to current state and forward extremities, and
@@ -592,7 +611,7 @@ class EventsPersistenceStorageController:
         events_and_contexts = task.events_and_contexts
         backfilled = task.backfilled
 
-        replaced_events: Dict[str, str] = {}
+        replaced_events: dict[str, str] = {}
         if not events_and_contexts:
             return replaced_events
 
@@ -622,28 +641,94 @@ class EventsPersistenceStorageController:
             for x in range(0, len(events_and_contexts), 100)
         ]
 
+        # Get the room version for the first event. This room version is the same for all events
+        # as events_and_contexts is all for one room.
+        assert len(events_and_contexts) > 0
+
         for chunk in chunks:
             # We can't easily parallelize these since different chunks
             # might contain the same event. :(
 
             new_forward_extremities = None
             state_delta_for_room = None
+            new_state_dag_extrems = None
 
-            if not backfilled:
-                with Measure(
-                    self._clock,
-                    name="_calculate_state_and_extrem",
-                    server_name=self.server_name,
-                ):
-                    # Work out the new "current state" for the room.
-                    # We do this by working out what the new extremities are and then
-                    # calculating the state from that.
-                    (
-                        new_forward_extremities,
-                        state_delta_for_room,
-                    ) = await self._calculate_new_forward_extremities_and_state_delta(
-                        room_id, chunk
+            if all_supports_msc4242_state_dag(chunk) and backfilled:
+                # Backfilled events do not update the room DAG extremities or the
+                # current state, but a state event which is new to us still has to move
+                # the state DAG forward extremities.
+                #
+                # In practice the only thing which gets here are state events from /send_join.
+                # Those events are persisted as backfilled so that they do not appear down
+                # /sync, but the state DAG forward extremities must be updated otherwise when
+                # we hit the join event we won't calculate the current state correctly due to having
+                # stale extremities.
+                #
+                # Catching up on a room we are already in does not come through here: the
+                # state DAG walk in /get_missing_events fetches `prev_state_events` at
+                # backfilled=False, and we refuse to persist any event whose
+                # `prev_state_events` we do not already hold, so an event cannot reach us
+                # ahead of the prev_state_events it references.
+                #
+                # There is one edge case here: when prev_events disagrees with prev_state_events. E.g:
+                #
+                #  prev_events graph             We know S1, S2, S3
+                # S1 <- S2 <- S3            Sx = state event, M = message
+                #  ^-- S4 <- S5 <- M        Backfilling M returns S4, S5 alongside it
+                #
+                # Suppose M incorrectly has prev_state_events=[S3] but prev_events=[S5]
+                # then /get_missing_events will NOT fetch S4, S5 and only when you /backfill
+                # the prev_events graph will you suddenly become aware of [S4, S5],
+                # which will hit this code path. In this case, we should be recalculating the current
+                # state to take S4,S5 into account but this code path does not.
+                # We rely on the caller (_process_pulled_events) to handle this case by checking if
+                # _backfilled_ events changed the state DAG forward extremities, and in the extremely
+                # unlikely case it did, warn in the logs and recalculate the room state.
+                seen_event_ids = await self.main_store.have_seen_events(
+                    room_id, [event.event_id for event, _ in chunk]
+                )
+                unseen_chunk = [
+                    (event, context)
+                    for event, context in chunk
+                    if event.event_id not in seen_event_ids
+                ]
+                if unseen_chunk:
+                    new_state_dag_extrems = (
+                        await self._calculate_new_state_dag_extremities(
+                            room_id,
+                            await self.main_store.get_state_dag_extremities(room_id),
+                            unseen_chunk,
+                        )
                     )
+            elif not backfilled:
+                if all_supports_msc4242_state_dag(chunk):
+                    with Measure(
+                        self._clock,
+                        name="_process_state_dag_forward_extremities_and_state_delta",
+                        server_name=self.server_name,
+                    ):
+                        (
+                            new_forward_extremities,  # for prev_events
+                            state_delta_for_room,  # for state groups
+                            new_state_dag_extrems,  # for prev_state_events
+                        ) = await self._process_state_dag_forward_extremities_and_state_delta(
+                            room_id, chunk
+                        )
+                else:
+                    with Measure(
+                        self._clock,
+                        name="_calculate_state_and_extrem",
+                        server_name=self.server_name,
+                    ):
+                        # Work out the new "current state" for the room.
+                        # We do this by working out what the new extremities are and then
+                        # calculating the state from that.
+                        (
+                            new_forward_extremities,
+                            state_delta_for_room,
+                        ) = await self._calculate_new_forward_extremities_and_state_delta(
+                            room_id, chunk
+                        )
 
             with Measure(
                 self._clock,
@@ -665,6 +750,31 @@ class EventsPersistenceStorageController:
             async with self._state_deletion_store.persisting_state_group_references(
                 events_and_contexts
             ):
+                newly_joined_servers: set[str] = set()
+                if self.hs.config.experimental.msc4354_enabled and state_delta_for_room:
+                    # We specifically only consider events in `chunk` to reduce the risk of state rollbacks
+                    # causing servers to appear to repeatedly rejoin rooms. This works because we only
+                    # persist events once, whereas the state delta may unreliably flap between joined members
+                    # on unrelated events. This means we may miss cases where the /first/ join event for a server
+                    # is as a result of a state rollback and not as a result of a new join event. That is fine
+                    # because the chance of that happening is vanishingly rare because the join event would need to be
+                    # persisted without it affecting the current state (e.g there's a concurrent ban for that user)
+                    # which is then revoked concurrently by a later event (e.g the user is unbanned).
+                    # If state resolution were more reliable (in terms of state resets) then we could feasibly only
+                    # consider the events in the state_delta_for_room, but we aren't there yet.
+                    new_event_ids_in_current_state = set(
+                        state_delta_for_room.to_insert.values()
+                    )
+                    newly_joined_servers = (
+                        await self._newly_joined_servers_after_state_change(
+                            room_id,
+                            [
+                                ev
+                                for (ev, _) in chunk
+                                if ev.event_id in new_event_ids_in_current_state
+                            ],
+                        )
+                    )
                 await self.persist_events_store._persist_events_and_state_updates(
                     room_id,
                     chunk,
@@ -673,13 +783,71 @@ class EventsPersistenceStorageController:
                     use_negative_stream_ordering=backfilled,
                     inhibit_local_membership_updates=backfilled,
                     new_event_links=new_event_links,
+                    new_state_dag_forward_extremities=new_state_dag_extrems,
+                    newly_joined_servers=newly_joined_servers,
                 )
+
+                if newly_joined_servers:
+                    # Notify federation senders after the server has joined,
+                    # so we can start to send historical sticky events.
+                    #
+                    # As per MSC4354:
+                    # > When a new server joins the room, existing servers MUST attempt to **push** all of their own sticky events[^newjoiner].
+                    # >
+                    # > — https://github.com/matrix-org/matrix-spec-proposals/blob/4ad14b0cd3b09205dcba59e45cbf1cab1e75edf7/proposals/4354-sticky-events.md#L91
+                    for server_name in newly_joined_servers:
+                        self.hs.get_notifier().notify_new_server_joined(
+                            server=server_name, room_id=room_id
+                        )
+
+                        if self.hs.config.redis.redis_enabled:
+                            self.hs.get_replication_command_handler().send_new_server_joined(
+                                server=server_name, room_id=room_id
+                            )
 
         return replaced_events
 
+    async def _newly_joined_servers_after_state_change(
+        self, room_id: str, new_events_in_current_state: list[EventBase]
+    ) -> set[str]:
+        """
+        Returns the set of servers that, after persisting `new_events_in_current_state` into the current state,
+        will be considered to have newly-joined the given room.
+
+        This function must be called BEFORE the current_state_events table is updated.
+
+        Args:
+            room_id: The room in question
+            new_events_in_current_state: A list of events that will become part of the current state,
+                but have not yet been persisted.
+        """
+        # filter to only join events from other servers. We're obviously joined if we are getting full events
+        # so needn't consider ourselves.
+        join_events = [
+            ev
+            for ev in new_events_in_current_state
+            if ev.type == EventTypes.Member
+            and ev.is_state()
+            and not self.is_mine_id(ev.state_key)
+            and ev.membership == Membership.JOIN
+        ]
+        if not join_events:
+            return set()
+
+        joining_domains = {get_domain_from_id(ev.state_key) for ev in join_events}
+
+        # We know the cache is up to date here because we are the event persister for the room,
+        # the only writer of current state for the room and so we'd have received our own
+        # cache invalidations immediately with no replication delay.
+        joined_domains = await self.main_store.get_current_hosts_in_room(room_id)
+
+        newly_joined_domains = joining_domains.difference(joined_domains)
+
+        return newly_joined_domains
+
     async def _calculate_new_forward_extremities_and_state_delta(
-        self, room_id: str, ev_ctx_rm: List[EventPersistencePair]
-    ) -> Tuple[Optional[Set[str]], Optional[DeltaState]]:
+        self, room_id: str, ev_ctx_rm: list[EventPersistencePair]
+    ) -> tuple[set[str] | None, DeltaState | None]:
         """Calculates the new forward extremities and state delta for a room
         given events to persist.
 
@@ -800,12 +968,222 @@ class EventsPersistenceStorageController:
 
         return (new_forward_extremities, delta)
 
+    async def _process_state_dag_forward_extremities_and_state_delta(
+        self,
+        room_id: str,
+        event_contexts: Sequence[tuple[MSC4242Event, EventContext]],
+    ) -> tuple[set[str] | None, DeltaState | None, set[str] | None]:
+        """Process the forwards extremities for state DAG rooms.
+        Returns:
+         - the new room dag extremities which should be written when these events are persisted.
+         - the state delta for the room, if applicable.
+         - the new state dag extremities which should be written when these events are persisted.
+
+        NB: this does not write them because if it did, new events may see them _before_ the events
+        get persisted, causing failures in retrieving state groups.
+        """
+        # Update forward extremities
+        # ...for the state DAG
+        existing_state_dag_fwd_extrems = (
+            await self.main_store.get_state_dag_extremities(room_id)
+        )
+        new_state_dag_fwd_extrems = await self._calculate_new_state_dag_extremities(
+            room_id,
+            existing_state_dag_fwd_extrems,
+            event_contexts,
+        )
+        # ...and the room DAG
+        existing_room_dag_fwd_extrems = (
+            await self.main_store.get_latest_event_ids_in_room(room_id)
+        )
+        new_room_dag_fwd_extrems = await self._calculate_new_extremities(
+            room_id,
+            event_contexts,
+            existing_room_dag_fwd_extrems,
+        )
+        assert new_room_dag_fwd_extrems, (
+            f"No room dag forward extremities left in room {room_id}!"
+        )
+
+        # See if we need to calculate a state delta
+        if new_state_dag_fwd_extrems == existing_state_dag_fwd_extrems:
+            # No change in state extremities, so no new state to calculate
+            return new_room_dag_fwd_extrems, None, new_state_dag_fwd_extrems
+
+        with Measure(
+            self._clock,
+            name="persist_events.state_dag.get_new_state_after_events",
+            server_name=self.server_name,
+        ):
+            (current_state, delta_ids, _) = await self._get_new_state_after_events(
+                room_id,
+                event_contexts,
+                existing_state_dag_fwd_extrems,
+                new_state_dag_fwd_extrems,
+                # do not prune forward extremities in the state DAG
+                # else we lose eventual delivery
+                should_prune=False,
+            )
+
+        # Following logic cargoculted from _calculate_new_forward_extremities_and_state_delta
+        # If either are not None then there has been a change,
+        # and we need to work out the delta (or use that
+        # given)
+        delta = None
+        if delta_ids is not None:
+            # If there is a delta we know that we've
+            # only added or replaced state, never
+            # removed keys entirely.
+            delta = DeltaState([], delta_ids)
+        elif current_state is not None:
+            with Measure(
+                self._clock,
+                name="persist_events.calculate_state_delta",
+                server_name=self.server_name,
+            ):
+                delta = await self._calculate_state_delta(room_id, current_state)
+
+        if delta:
+            # If we have a change of state then lets check
+            # whether we're actually still a member of the room,
+            # or if our last user left. If we're no longer in
+            # the room then we delete the current state and
+            # extremities.
+            is_still_joined = await self._is_server_still_joined(
+                room_id,
+                event_contexts,
+                delta,
+            )
+            if not is_still_joined:
+                logger.info("Server no longer in room %s", room_id)
+                delta.no_longer_in_room = True
+
+        return new_room_dag_fwd_extrems, delta, new_state_dag_fwd_extrems
+
+    async def _calculate_new_state_dag_extremities(
+        self,
+        room_id: str,
+        existing_fwd_extrems: frozenset[str],
+        event_contexts: Sequence[tuple[MSC4242Event, EventContext]],
+    ) -> set[str]:
+        """Calculate the new state dag forward extremities. Modifies existing_fwd_extrems.
+
+        Assumes that event_contexts are only state events which should be in the state DAG.
+
+        Raises:
+            SynapseError: if the new events include unknown prev_state_events
+            AssertionError: if there are no state DAG forward extremities remaining in the room
+        """
+        # Events are always processed in causal order without any gaps in the DAG
+        # (prev_state_events are always known), guaranteeing that processed events have a path to the
+        # create event. This is an emergent property of state DAGs as asserting that there is a path
+        # to the create event every time we insert an event would be prohibitively expensive.
+        # This is similar to how doubly-linked lists can potentially not refer to previous items correctly
+        # without verifying the list's integrity, but doing it on every insert is too expensive.
+
+        # filter out events which don't belong in the state dag.
+        new_state_events_contexts = [
+            (e, ctx) for e, ctx in event_contexts if event_exists_in_state_dag(e)
+        ]
+        if len(new_state_events_contexts) == 0:
+            # if there are no state events being persisted, then the fwd extremities of the state dag
+            # do not change.
+            return set(existing_fwd_extrems)
+
+        # This logic is very similar to _calculate_new_extremities with a few key differences:
+        #  - We do not "Remove any events which are prev_events of any existing events." because the
+        #    state DAG mandates that events are processed in causal order, so there MUST NOT be any
+        #    existing, processed events which have the to-be-persisted events as prev_state_events.
+        #  - We don't care if they are an "outlier" in the main room dag, so long as they AREN'T
+        #    an outlier on the state dag, which this function checks, so we don't check outlier-ness.
+        #  - We allow *soft-failed* events to become forward extremities, as per the MSC. We do not
+        #    allow *rejected* events to become forward extremities though.
+
+        rejected_events = [ev for ev, ctx in new_state_events_contexts if ctx.rejected]
+        new_state_events = [
+            ev for ev, ctx in new_state_events_contexts if not ctx.rejected
+        ]
+        # We want to check that we are not missing any prev_state_events.
+        # To do this, we include rejected events in this check because other events may point to them.
+        # If we didn't include them, we might incorrectly say we are missing events when we are not.
+        all_new_state_events = set(rejected_events + new_state_events)
+
+        # First, verify that we know all prev_state_events. If we fail this check then we don't have
+        # a complete DAG and that is bad, so bail out.
+
+        # Start with them all missing.
+        missing_prev_state_events = {
+            e_id for event in all_new_state_events for e_id in event.prev_state_events
+        }
+
+        # remove prev events which appear in all_events
+        missing_prev_state_events.difference_update(
+            event.event_id for event in all_new_state_events
+        )
+        # the rest of these events should be present in the DB. Some of them may be forward extremities,
+        # some may not be, that's ok.
+        seen_events = await self.main_store.have_seen_events(
+            room_id,
+            missing_prev_state_events,
+        )
+        missing_prev_state_events.difference_update(seen_events)
+
+        if len(missing_prev_state_events) > 0:
+            logger.error(
+                "_calculate_new_state_dag_extremities: missing the following prev_state_events in room %s : %s",
+                room_id,
+                missing_prev_state_events,
+            )
+            logger.error(
+                "_calculate_new_state_dag_extremities: was handling %s",
+                shortstr([ev.event_id for ev in all_new_state_events]),
+            )
+            raise SynapseError(
+                code=500,
+                msg=f"missing {len(missing_prev_state_events)} prev_state_events in room {room_id}",
+            )
+
+        # Now calculate the forward extremities.
+
+        # start with the existing forward extremities
+        result = set(existing_fwd_extrems)
+
+        # add all the new events to the list
+        result.update(event.event_id for event in new_state_events)
+
+        # Now remove all events which are prev_state_events of any of the new events
+        result.difference_update(
+            e_id for event in new_state_events for e_id in event.prev_state_events
+        )
+
+        # Finally handle the case where the new events have rejected/soft-failed `prev_state_events`.
+        # If they do we need to remove them and their `prev_state_events`,
+        # otherwise we end up with dangling extremities.
+        # Specifically, this handles the case where (F=fwd extrem, SF=soft-failed, N=new event)
+        # F <-- SF <-- SF <-- N
+        # where we want to remove F as a forward extremity and replace with N.
+        existing_prevs = await self.persist_events_store._get_prevs_before_rejected(
+            (e_id for event in new_state_events for e_id in event.prev_state_events),
+            include_soft_failed=False,
+        )
+        result.difference_update(existing_prevs)
+
+        # We only update metrics for events that change forward extremities
+        if result != existing_fwd_extrems:
+            msc4242_state_dag_forward_extremities_counter.labels(
+                **{SERVER_NAME_LABEL: self.server_name}
+            ).observe(len(result))
+
+        # There should always be at least one forward extremity.
+        assert result, f"No state dag forward extremities left in room {room_id}!"
+        return result
+
     async def _calculate_new_extremities(
         self,
         room_id: str,
-        event_contexts: List[EventPersistencePair],
+        event_contexts: Sequence[EventPersistencePair],
         latest_event_ids: AbstractSet[str],
-    ) -> Set[str]:
+    ) -> set[str]:
         """Calculates the new forward extremities for a room given events to
         persist.
 
@@ -863,10 +1241,11 @@ class EventsPersistenceStorageController:
     async def _get_new_state_after_events(
         self,
         room_id: str,
-        events_context: List[EventPersistencePair],
+        events_context: Sequence[EventPersistencePair],
         old_latest_event_ids: AbstractSet[str],
-        new_latest_event_ids: Set[str],
-    ) -> Tuple[Optional[StateMap[str]], Optional[StateMap[str]], Set[str]]:
+        new_latest_event_ids: set[str],
+        should_prune: bool = True,
+    ) -> tuple[StateMap[str] | None, StateMap[str] | None, set[str]]:
         """Calculate the current state dict after adding some new events to
         a room
 
@@ -880,8 +1259,14 @@ class EventsPersistenceStorageController:
             old_latest_event_ids:
                 the old forward extremities for the room.
 
-            new_latest_event_ids :
+            new_latest_event_ids:
                 the new forward extremities for the room.
+
+            should_prune:
+                if true, attempt to prune the forward extremities.
+                Pruning means we will not communicate some new events to other servers,
+                which can compromise eventual delivery, so graphs which are fully synchronised
+                e.g. state DAGs should not prune.
 
         Returns:
             Returns a tuple of two state maps and a set of new forward
@@ -1022,7 +1407,7 @@ class EventsPersistenceStorageController:
         # If the returned state matches the state group of one of the new
         # forward extremities then we check if we are able to prune some state
         # extremities.
-        if res.state_group and res.state_group in new_state_groups:
+        if should_prune and res.state_group and res.state_group in new_state_groups:
             new_latest_event_ids = await self._prune_extremities(
                 room_id,
                 new_latest_event_ids,
@@ -1037,11 +1422,11 @@ class EventsPersistenceStorageController:
     async def _prune_extremities(
         self,
         room_id: str,
-        new_latest_event_ids: Set[str],
+        new_latest_event_ids: set[str],
         resolved_state_group: int,
-        event_id_to_state_group: Dict[str, int],
-        events_context: List[EventPersistencePair],
-    ) -> Set[str]:
+        event_id_to_state_group: dict[str, int],
+        events_context: Sequence[EventPersistencePair],
+    ) -> set[str]:
         """See if we can prune any of the extremities after calculating the
         resolved state.
         """
@@ -1108,7 +1493,7 @@ class EventsPersistenceStorageController:
             # as a first cut.
             events_to_check: Collection[EventBase] = [event]
             while events_to_check:
-                new_events: Set[str] = set()
+                new_events: set[str] = set()
                 for event_to_check in events_to_check:
                     if self.is_mine_id(event_to_check.sender):
                         if event_to_check.type != EventTypes.Dummy:
@@ -1177,7 +1562,7 @@ class EventsPersistenceStorageController:
     async def _is_server_still_joined(
         self,
         room_id: str,
-        ev_ctx_rm: List[EventPersistencePair],
+        ev_ctx_rm: Sequence[EventPersistencePair],
         delta: DeltaState,
     ) -> bool:
         """Check if the server will still be joined after the given events have

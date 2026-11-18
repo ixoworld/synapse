@@ -18,7 +18,7 @@
 #
 #
 import io
-from typing import Any, Dict, Generator
+from typing import Any, Generator
 from unittest.mock import ANY, Mock, create_autospec
 
 from netaddr import IPSet
@@ -28,6 +28,7 @@ from twisted.internet import defer
 from twisted.internet.defer import Deferred, TimeoutError
 from twisted.internet.error import ConnectingCancelledError, DNSLookupError
 from twisted.internet.testing import MemoryReactor, StringTransport
+from twisted.python.failure import Failure
 from twisted.web.client import Agent, ResponseNeverReceived
 from twisted.web.http import HTTPChannel
 from twisted.web.http_headers import Headers
@@ -112,6 +113,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         protocol = factory.buildProtocol(None)
+        assert protocol is not None
         transport = StringTransport()
         protocol.makeConnection(transport)
 
@@ -169,7 +171,7 @@ class FederationClientTests(HomeserverTestCase):
         self.assertEqual(host, "1.2.3.4")
         self.assertEqual(port, 8008)
         e = Exception("go away")
-        factory.clientConnectionFailed(None, e)
+        factory.clientConnectionFailed(self.reactor.connectors[0], Failure(e))
         self.pump(0.5)
 
         f = self.failureResultOf(d)
@@ -231,6 +233,7 @@ class FederationClientTests(HomeserverTestCase):
 
         conn = Mock()
         client = clients[0][2].buildProtocol(None)
+        assert client is not None
         client.makeConnection(conn)
 
         # Deferred is still without a result
@@ -327,6 +330,7 @@ class FederationClientTests(HomeserverTestCase):
         conn = Mock()
         clients = self.reactor.tcpClients
         client = clients[0][2].buildProtocol(None)
+        assert client is not None
         client.makeConnection(conn)
 
         # Deferred does not have a result
@@ -369,6 +373,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         protocol = factory.buildProtocol(None)
+        assert protocol is not None
         transport = StringTransport()
         protocol.makeConnection(transport)
 
@@ -394,6 +399,7 @@ class FederationClientTests(HomeserverTestCase):
         self.assertEqual(host, "1.2.3.4")
         self.assertEqual(port, 8008)
         protocol = factory.buildProtocol(None)
+        assert protocol is not None
         transport = StringTransport()
         protocol.makeConnection(transport)
 
@@ -414,6 +420,66 @@ class FederationClientTests(HomeserverTestCase):
         self.assertEqual(length, len(data))
         self.assertEqual(output_stream.getvalue(), data)
 
+    @override_config(
+        {
+            "federation": {
+                # Set the timeout to a deterministic value, in case the defaults
+                # change.
+                "client_timeout": "10s",
+            }
+        }
+    )
+    def test_authed_media_timeout_reading_body(self) -> None:
+        """
+        If the HTTP request is connected, but gets no response before being
+        timed out, it'll give a RequestSendFailed with can_retry.
+
+        Regression test for https://github.com/element-hq/synapse/issues/19061
+        """
+        limiter = Ratelimiter(
+            store=self.hs.get_datastores().main,
+            clock=self.clock,
+            cfg=RatelimitSettings(key="", per_second=0.17, burst_count=1048576),
+        )
+
+        output_stream = io.BytesIO()
+
+        d = defer.ensureDeferred(
+            # timeout is set by `client_timeout`, which we override above.
+            self.cl.federation_get_file(
+                "testserv:8008", "path", output_stream, limiter, "127.0.0.1", 10000
+            )
+        )
+
+        self.pump()
+
+        conn = Mock()
+        clients = self.reactor.tcpClients
+        client = clients[0][2].buildProtocol(None)
+        assert client is not None
+        client.makeConnection(conn)
+
+        # Deferred does not have a result
+        self.assertNoResult(d)
+
+        # Send it the HTTP response
+        client.dataReceived(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Server: Fake\r\n"
+            # Set a large content length, prompting the federation client to
+            # wait to receive the rest of the body.
+            b"Content-Length: 1000\r\n"
+            b"Content-Type: multipart/mixed; boundary=6067d4698f8d40a0a794ea7d7379d53a\r\n\r\n"
+        )
+
+        # Push by enough to time it out
+        self.reactor.advance(10.5)
+        f = self.failureResultOf(d)
+
+        self.assertIsInstance(f.value, RequestSendFailed)
+        self.assertTrue(f.value.can_retry)
+        self.assertIsInstance(f.value.inner_exception, defer.TimeoutError)
+
     @parameterized.expand(["get_json", "post_json", "delete_json", "put_json"])
     def test_timeout_reading_body(self, method_name: str) -> None:
         """
@@ -428,6 +494,7 @@ class FederationClientTests(HomeserverTestCase):
         conn = Mock()
         clients = self.reactor.tcpClients
         client = clients[0][2].buildProtocol(None)
+        assert client is not None
         client.makeConnection(conn)
 
         # Deferred does not have a result
@@ -467,6 +534,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         client = factory.buildProtocol(None)
+        assert client is not None
         conn = StringTransport()
         client.makeConnection(conn)
 
@@ -522,6 +590,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         client = factory.buildProtocol(None)
+        assert client is not None
         conn = StringTransport()
         client.makeConnection(conn)
 
@@ -558,6 +627,7 @@ class FederationClientTests(HomeserverTestCase):
         clients = self.reactor.tcpClients
         self.assertEqual(len(clients), 1)
         client = clients[0][2].buildProtocol(None)
+        assert client is not None
         server = HTTPChannel()
 
         client.makeConnection(FakeTransport(server, self.reactor))
@@ -583,6 +653,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         client = factory.buildProtocol(None)
+        assert client is not None
         conn = StringTransport()
         client.makeConnection(conn)
 
@@ -631,6 +702,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         protocol = factory.buildProtocol(None)
+        assert protocol is not None
         transport = StringTransport()
         protocol.makeConnection(transport)
 
@@ -677,6 +749,7 @@ class FederationClientTests(HomeserverTestCase):
 
         # complete the connection and wire it up to a fake transport
         protocol = factory.buildProtocol(None)
+        assert protocol is not None
         transport = StringTransport()
         protocol.makeConnection(transport)
 
@@ -745,7 +818,7 @@ class FederationClientTests(HomeserverTestCase):
 
 
 class FederationClientProxyTests(BaseMultiWorkerStreamTestCase):
-    def default_config(self) -> Dict[str, Any]:
+    def default_config(self) -> dict[str, Any]:
         conf = super().default_config()
         conf["instance_map"] = {
             "main": {"host": "testserv", "port": 8765},

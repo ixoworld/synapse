@@ -20,29 +20,25 @@
 import base64
 import logging
 import os
-from typing import Generator, List, Optional, cast
+from typing import Generator, cast
 from unittest.mock import AsyncMock, call, patch
 
 import treq
 from netaddr import IPSet
 from service_identity import VerificationError
-from zope.interface import implementer
 
 from twisted.internet import defer
-from twisted.internet._sslverify import ClientTLSOptions, OpenSSLCertificateOptions
 from twisted.internet.defer import Deferred
 from twisted.internet.endpoints import _WrappingProtocol
-from twisted.internet.interfaces import (
-    IOpenSSLClientConnectionCreator,
-    IProtocolFactory,
-)
+from twisted.internet.interfaces import IProtocolFactory
 from twisted.internet.protocol import Factory, Protocol
 from twisted.protocols.tls import TLSMemoryBIOProtocol
+from twisted.python.failure import Failure
 from twisted.web._newclient import ResponseNeverReceived
 from twisted.web.client import Agent
 from twisted.web.http import HTTPChannel, Request
 from twisted.web.http_headers import Headers
-from twisted.web.iweb import IPolicyForHTTPS, IResponse
+from twisted.web.iweb import IResponse
 
 from synapse.config.homeserver import HomeServerConfig
 from synapse.config.server import parse_proxy_config
@@ -77,7 +73,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
 
         self.mock_resolver = AsyncMock(spec=SrvResolver)
 
-        config_dict = default_config("test", parse=False)
+        config_dict = default_config(server_name="test", parse=False)
         config_dict["federation_custom_ca_list"] = [get_test_ca_cert_file()]
 
         self._config = config = HomeServerConfig()
@@ -85,7 +81,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
 
         self.tls_factory = FederationPolicyForHTTPS(config)
 
-        self.well_known_cache: TTLCache[bytes, Optional[bytes]] = TTLCache(
+        self.well_known_cache: TTLCache[bytes, bytes | None] = TTLCache(
             cache_name="test_cache",
             server_name="test_server",
             timer=self.reactor.seconds,
@@ -109,8 +105,8 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self,
         client_factory: IProtocolFactory,
         ssl: bool = True,
-        expected_sni: Optional[bytes] = None,
-        tls_sanlist: Optional[List[bytes]] = None,
+        expected_sni: bytes | None = None,
+        tls_sanlist: list[bytes] | None = None,
     ) -> HTTPChannel:
         """Builds a test server, and completes the outgoing client connection
         Args:
@@ -228,7 +224,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
         client_factory: IProtocolFactory,
         expected_sni: bytes,
         content: bytes,
-        response_headers: Optional[dict] = None,
+        response_headers: dict | None = None,
     ) -> HTTPChannel:
         """Handle an outgoing HTTPs connection: wire it up to a server, check that the
         request is for a .well-known, and send the response.
@@ -257,7 +253,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self,
         request: Request,
         content: bytes,
-        headers: Optional[dict] = None,
+        headers: dict | None = None,
     ) -> None:
         """Check that an incoming request looks like a valid .well-known request, and
         send back the response.
@@ -397,7 +393,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
     def _do_get_via_proxy(
         self,
         expect_proxy_ssl: bool = False,
-        expected_auth_credentials: Optional[bytes] = None,
+        expected_auth_credentials: bytes | None = None,
     ) -> None:
         """Send a https federation request via an agent and check that it is correctly
             received at the proxy and client. The proxy can use either http or https.
@@ -679,7 +675,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 443)
 
         # fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[0], Failure(Exception("nope"))
+        )
 
         # attemptdelay on the hostnameendpoint is 0.3, so takes that long before the
         # .well-known request fails.
@@ -765,7 +763,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 443)
 
         # fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
 
         # attemptdelay on the hostnameendpoint is 0.3, so  takes that long before the
         # .well-known request fails.
@@ -1019,7 +1019,7 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.mock_resolver.resolve_service.return_value = []
         self.reactor.lookups["testserv"] = "1.2.3.4"
 
-        config = default_config("test", parse=True)
+        config = default_config(server_name="test", parse=True)
 
         # Build a new agent and WellKnownResolver with a different tls factory
         tls_factory = FederationPolicyForHTTPS(config)
@@ -1305,7 +1305,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 443)
 
         # fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
 
         # attemptdelay on the hostnameendpoint is 0.3, so  takes that long before the
         # .well-known request fails.
@@ -1544,7 +1546,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
 
             # fonx the connection attempt, this will be treated as a temporary
             # failure.
-            client_factory.clientConnectionFailed(None, Exception("nope"))
+            client_factory.clientConnectionFailed(
+                self.reactor.connectors[-1], Failure(Exception("nope"))
+            )
 
             # There's a few sleeps involved, so we have to pump the reactor a
             # bit.
@@ -1568,7 +1572,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
 
         clients = self.reactor.tcpClients
         (host, port, client_factory, _timeout, _bindAddress) = clients.pop(0)
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
         self.reactor.pump((0.4,))
 
         r = self.successResultOf(fetch_d)
@@ -1627,7 +1633,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 8443)
 
         # Fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
 
         # There's a 300ms delay in HostnameEndpoint
         self.reactor.pump((0.4,))
@@ -1687,7 +1695,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 8443)
 
         # Fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
 
         # There's a 300ms delay in HostnameEndpoint
         self.reactor.pump((0.4,))
@@ -1745,7 +1755,9 @@ class MatrixFederationAgentTests(unittest.TestCase):
         self.assertEqual(port, 8443)
 
         # Fonx the connection
-        client_factory.clientConnectionFailed(None, Exception("nope"))
+        client_factory.clientConnectionFailed(
+            self.reactor.connectors[-1], Failure(Exception("nope"))
+        )
 
         # There's a 300ms delay in HostnameEndpoint
         self.reactor.pump((0.4,))
@@ -1830,26 +1842,12 @@ def _get_test_protocol_factory() -> IProtocolFactory:
     Returns:
         interfaces.IProtocolFactory
     """
-    server_factory = Factory.forProtocol(HTTPChannel)
-
-    # Request.finish expects the factory to have a 'log' method.
-    server_factory.log = _log_request
-
-    return server_factory
+    return _HTTPFactory()
 
 
-def _log_request(request: str) -> None:
-    """Implements Factory.log, which is expected by Request.finish"""
-    logger.info("Completed request %s", request)
+class _HTTPFactory(Factory):
+    protocol = HTTPChannel
 
-
-@implementer(IPolicyForHTTPS)
-class TrustingTLSPolicyForHTTPS:
-    """An IPolicyForHTTPS which checks that the certificate belongs to the
-    right server, but doesn't check the certificate chain."""
-
-    def creatorForNetloc(
-        self, hostname: bytes, port: int
-    ) -> IOpenSSLClientConnectionCreator:
-        certificateOptions = OpenSSLCertificateOptions()
-        return ClientTLSOptions(hostname, certificateOptions.getContext())
+    def log(self, request: Request) -> None:
+        """Request.finish expects the factory to have a 'log' method."""
+        logger.info("Completed request %s", request)

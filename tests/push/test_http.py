@@ -17,7 +17,7 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import Any, Dict, List, Tuple
+from typing import Any
 from unittest.mock import Mock
 
 from parameterized import parameterized
@@ -25,9 +25,10 @@ from parameterized import parameterized
 from twisted.internet.defer import Deferred
 from twisted.internet.testing import MemoryReactor
 
-import synapse.rest.admin
+from synapse.api.constants import EventContentFields
 from synapse.logging.context import make_deferred_yieldable
 from synapse.push import PusherConfig, PusherConfigException
+from synapse.rest import admin
 from synapse.rest.admin.experimental_features import ExperimentalFeature
 from synapse.rest.client import login, push_rule, pusher, receipts, room, versions
 from synapse.server import HomeServer
@@ -39,7 +40,7 @@ from tests.unittest import HomeserverTestCase, override_config
 
 class HTTPPusherTests(HomeserverTestCase):
     servlets = [
-        synapse.rest.admin.register_servlets_for_client_rest_resource,
+        admin.register_servlets_for_client_rest_resource,
         room.register_servlets,
         login.register_servlets,
         receipts.register_servlets,
@@ -51,7 +52,7 @@ class HTTPPusherTests(HomeserverTestCase):
     hijack_auth = False
 
     def make_homeserver(self, reactor: MemoryReactor, clock: Clock) -> HomeServer:
-        self.push_attempts: List[Tuple[Deferred, str, dict]] = []
+        self.push_attempts: list[tuple[Deferred, str, dict]] = []
 
         m = Mock()
 
@@ -422,10 +423,10 @@ class HTTPPusherTests(HomeserverTestCase):
         # check that this is low-priority
         self.assertEqual(self.push_attempts[1][2]["notification"]["prio"], "low")
 
-    def test_sends_high_priority_for_mention(self) -> None:
+    def test_sends_high_priority_for_user_mention(self) -> None:
         """
         The HTTP pusher will send pushes at high priority if they correspond
-        to a message containing the user's display name.
+        to a message that intentionally mentions the user via `m.mentions`.
         """
         # Register the user who gets notified
         user_id = self.register_user("user", "pass")
@@ -469,8 +470,18 @@ class HTTPPusherTests(HomeserverTestCase):
             )
         )
 
-        # Send a message
-        self.helper.send(room, body="Oh, user, hello!", tok=other_access_token)
+        # Send a message mentioning the user. As a client would, the body refers
+        # to the user as well, but it is `m.mentions` that makes it a mention.
+        self.helper.send_event(
+            room,
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": "Oh, @user, hello!",
+                EventContentFields.MENTIONS: {"user_ids": [user_id]},
+            },
+            tok=other_access_token,
+        )
 
         # Advance time a bit, so the pusher will register something has happened
         self.pump()
@@ -547,10 +558,15 @@ class HTTPPusherTests(HomeserverTestCase):
             )
         )
 
-        # Send a message
-        self.helper.send(
+        # Send a message mentioning the room
+        self.helper.send_event(
             room,
-            body="@room eeek! There's a spider on the table!",
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": "@room eeek! There's a spider on the table!",
+                EventContentFields.MENTIONS: {"room": True},
+            },
             tok=other_access_token,
         )
 
@@ -569,8 +585,15 @@ class HTTPPusherTests(HomeserverTestCase):
         self.assertEqual(self.push_attempts[0][2]["notification"]["prio"], "high")
 
         # Send another event, this time as someone without the power of @room
-        self.helper.send(
-            room, body="@room the spider is gone", tok=yet_another_access_token
+        self.helper.send_event(
+            room,
+            "m.room.message",
+            {
+                "msgtype": "m.text",
+                "body": "@room the spider is gone",
+                EventContentFields.MENTIONS: {"room": True},
+            },
+            tok=yet_another_access_token,
         )
 
         # Advance time a bit, so the pusher will register something has happened
@@ -747,7 +770,7 @@ class HTTPPusherTests(HomeserverTestCase):
 
     def _make_user_with_pusher(
         self, username: str, enabled: bool = True
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """Registers a user and creates a pusher for them.
 
         Args:
@@ -925,7 +948,7 @@ class HTTPPusherTests(HomeserverTestCase):
         ret = self.get_success(
             self.hs.get_datastores().main.get_pushers_by({"user_name": user_id})
         )
-        pushers: List[PusherConfig] = list(ret)
+        pushers: list[PusherConfig] = list(ret)
 
         # Check that we still have one pusher, and that the device ID associated with
         # it didn't change.
@@ -1024,33 +1047,6 @@ class HTTPPusherTests(HomeserverTestCase):
             lookup_result.device_id,
         )
 
-    def test_msc3881_client_versions_flag(self) -> None:
-        """Tests that MSC3881 only appears in /versions if user has it enabled."""
-
-        user_id = self.register_user("user", "pass")
-        access_token = self.login("user", "pass")
-
-        # Check feature is disabled in /versions
-        channel = self.make_request(
-            "GET", "/_matrix/client/versions", access_token=access_token
-        )
-        self.assertEqual(channel.code, 200)
-        self.assertFalse(channel.json_body["unstable_features"]["org.matrix.msc3881"])
-
-        # Enable feature for user
-        self.get_success(
-            self.hs.get_datastores().main.set_features_for_user(
-                user_id, {ExperimentalFeature.MSC3881: True}
-            )
-        )
-
-        # Check feature is now enabled in /versions for user
-        channel = self.make_request(
-            "GET", "/_matrix/client/versions", access_token=access_token
-        )
-        self.assertEqual(channel.code, 200)
-        self.assertTrue(channel.json_body["unstable_features"]["org.matrix.msc3881"])
-
     @override_config({"push": {"jitter_delay": "10s"}})
     def test_jitter(self) -> None:
         """Tests that enabling jitter actually delays sending push."""
@@ -1118,7 +1114,7 @@ class HTTPPusherTests(HomeserverTestCase):
         device_id = user_tuple.device_id
 
         # Set the push data dict based on test input parameters
-        push_data: Dict[str, Any] = {
+        push_data: dict[str, Any] = {
             "url": "http://example.com/_matrix/push/v1/notify",
         }
         if disable_badge_count:
@@ -1245,3 +1241,53 @@ class HTTPPusherTests(HomeserverTestCase):
             self.push_attempts[3][2]["notification"]["content"]["body"], "Message 3"
         )
         self.push_attempts[3][0].callback({})
+
+
+class MSC3881VersionsTestCase(HomeserverTestCase):
+    """
+    Tests that MSC3881 (Remotely toggle push notifications for another client) support
+    is correctly advertised in /versions.
+    """
+
+    servlets = [
+        admin.register_servlets,
+        login.register_servlets,
+        versions.register_servlets,
+    ]
+
+    def tearDown(self) -> None:
+        # MemoryReactor doesn't trigger the shutdown phases, and we want the
+        # Tokio thread pool to be stopped
+        # XXX: This logic should probably get moved somewhere else
+        shutdown_triggers = self.reactor.triggers.get("shutdown", {})
+        for phase in ["before", "during", "after"]:
+            triggers = shutdown_triggers.get(phase, [])
+            for callbable, args, kwargs in triggers:
+                callbable(*args, **kwargs)
+
+    def test_msc3881_client_versions_flag(self) -> None:
+        """Tests that MSC3881 only appears in /versions if user has it enabled."""
+
+        user_id = self.register_user("user", "pass")
+        access_token = self.login("user", "pass")
+
+        # Check feature is disabled in /versions
+        channel = self.make_request(
+            "GET", "/_matrix/client/versions", access_token=access_token
+        )
+        self.assertEqual(channel.code, 200)
+        self.assertFalse(channel.json_body["unstable_features"]["org.matrix.msc3881"])
+
+        # Enable feature for user
+        self.get_success(
+            self.hs.get_datastores().main.set_features_for_user(
+                user_id, {ExperimentalFeature.MSC3881: True}
+            )
+        )
+
+        # Check feature is now enabled in /versions for user
+        channel = self.make_request(
+            "GET", "/_matrix/client/versions", access_token=access_token
+        )
+        self.assertEqual(channel.code, 200)
+        self.assertTrue(channel.json_body["unstable_features"]["org.matrix.msc3881"])

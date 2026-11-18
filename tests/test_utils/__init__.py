@@ -24,11 +24,11 @@ Utilities for running the unit tests
 """
 
 import base64
-import json
+import os
 import sys
 import warnings
 from binascii import unhexlify
-from typing import TYPE_CHECKING, Awaitable, Callable, Tuple, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar
 
 import attr
 import zope.interface
@@ -40,12 +40,43 @@ from twisted.web.http import RESPONSES
 from twisted.web.http_headers import Headers
 from twisted.web.iweb import IResponse
 
+from synapse.media.storage_provider import (
+    FileStorageProviderBackend,
+    StorageProviderWrapper,
+)
 from synapse.types import JsonSerializable
+from synapse.util.json import json_encoder
 
 if TYPE_CHECKING:
     from sys import UnraisableHookArgs
 
+    from synapse.server import HomeServer
+
 TV = TypeVar("TV")
+
+
+def list_stored_media_files(hs: "HomeServer") -> set[str]:
+    """List the absolute path of every file in the media store, as well as
+    any file-backed media storage providers.
+
+    Note that the media store path may be shared between tests, so compare
+    against a listing taken earlier in the test rather than expecting it to
+    start off empty.
+    """
+    directories = [hs.config.media.media_store_path]
+    for provider in hs.get_media_repository().media_storage.storage_providers:
+        # Only file-backed providers write anything we can look at on disk.
+        if isinstance(provider, StorageProviderWrapper) and isinstance(
+            provider.backend, FileStorageProviderBackend
+        ):
+            directories.append(provider.backend.base_directory)
+
+    return {
+        os.path.join(dirpath, filename)
+        for directory in directories
+        for dirpath, _, filenames in os.walk(directory)
+        for filename in filenames
+    }
 
 
 def get_awaitable_result(awaitable: Awaitable[TV]) -> TV:
@@ -102,7 +133,7 @@ class FakeResponse:  # type: ignore[misc]
     attribute, and didn't support deliverBody until recently.
     """
 
-    version: Tuple[bytes, int, int] = (b"HTTP", 1, 1)
+    version: tuple[bytes, int, int] = (b"HTTP", 1, 1)
 
     # HTTP response code
     code: int = 200
@@ -127,7 +158,7 @@ class FakeResponse:  # type: ignore[misc]
     @classmethod
     def json(cls, *, code: int = 200, payload: JsonSerializable) -> "FakeResponse":
         headers = Headers({"Content-Type": ["application/json"]})
-        body = json.dumps(payload).encode("utf-8")
+        body = json_encoder.encode(payload).encode("utf-8")
         return cls(code=code, body=body, headers=headers)
 
 

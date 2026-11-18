@@ -19,7 +19,9 @@
 #
 #
 import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from abc import ABC, abstractmethod
+from http import HTTPStatus
+from typing import TYPE_CHECKING
 
 from netaddr import IPAddress
 
@@ -33,7 +35,7 @@ from synapse.api.errors import (
     MissingClientTokenError,
     UnstableSpecAuthError,
 )
-from synapse.appservice import ApplicationService
+from synapse.appservice import ApplicationService, Scopes
 from synapse.http import get_request_user_agent
 from synapse.http.site import SynapseRequest
 from synapse.logging.opentracing import trace
@@ -48,7 +50,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class BaseAuth:
+class BaseAuth(ABC):
     """Common base class for all auth implementations."""
 
     def __init__(self, hs: "HomeServer"):
@@ -64,7 +66,7 @@ class BaseAuth:
         room_id: str,
         requester: Requester,
         allow_departed_users: bool = False,
-    ) -> Tuple[str, Optional[str]]:
+    ) -> tuple[str, str | None]:
         """Check if the user is in the room, or was at some point.
         Args:
             room_id: The room to check.
@@ -114,7 +116,7 @@ class BaseAuth:
     @trace
     async def check_user_in_room_or_world_readable(
         self, room_id: str, requester: Requester, allow_departed_users: bool = False
-    ) -> Tuple[str, Optional[str]]:
+    ) -> tuple[str, str | None]:
         """Checks that the user is or was in the room or the room is world
         readable. If it isn't then an exception is raised.
 
@@ -128,6 +130,9 @@ class BaseAuth:
             Resolves to the current membership of the user in the room and the
             membership event ID of the user. If the user is not in the room and
             never has been, then `(Membership.JOIN, None)` is returned.
+
+            The same is returned for a user who left a server announcement room,
+            so that they keep reading it like a user who never joined.
         """
 
         try:
@@ -136,24 +141,42 @@ class BaseAuth:
             #  * The user is a non-guest user, and was ever in the room
             #  * The user is a guest user, and has joined the room
             # else it will throw.
-            return await self.check_user_in_room(
+            membership, member_event_id = await self.check_user_in_room(
                 room_id, requester, allow_departed_users=allow_departed_users
             )
         except AuthError:
-            visibility = await self._storage_controllers.state.get_current_state_event(
-                room_id, EventTypes.RoomHistoryVisibility, ""
-            )
-            if (
-                visibility
-                and visibility.content.get("history_visibility")
-                == HistoryVisibility.WORLD_READABLE
-            ):
+            if await self._is_world_readable(room_id):
                 return Membership.JOIN, None
             raise AuthError(
                 403,
                 "User %r not in room %s, and room previews are disabled"
                 % (requester.user, room_id),
             )
+
+        # Allow users who left a server announcement room to keep reading it.
+        if (
+            membership != Membership.JOIN
+            and await self._is_server_announcement_room(room_id)
+            and await self._is_world_readable(room_id)
+        ):
+            return Membership.JOIN, None
+
+        return membership, member_event_id
+
+    async def _is_world_readable(self, room_id: str) -> bool:
+        """Whether the room's history is visible to anyone."""
+        visibility = await self._storage_controllers.state.get_current_state_event(
+            room_id, EventTypes.RoomHistoryVisibility, ""
+        )
+        return (
+            visibility is not None
+            and visibility.content.get("history_visibility")
+            == HistoryVisibility.WORLD_READABLE
+        )
+
+    async def _is_server_announcement_room(self, room_id: str) -> bool:
+        """Whether the room is a server announcement room."""
+        return room_id in await self.store.get_server_announcement_room_ids()
 
     async def validate_appservice_can_control_user_id(
         self, app_service: ApplicationService, user_id: str
@@ -186,6 +209,7 @@ class BaseAuth:
                 403, "Application service has not registered this user (%s)" % user_id
             )
 
+    @abstractmethod
     async def is_server_admin(self, requester: Requester) -> bool:
         """Check if the given user is a local server admin.
 
@@ -238,6 +262,40 @@ class BaseAuth:
         )
 
         return user_level >= send_level
+
+    @abstractmethod
+    async def get_user_by_req(
+        self,
+        request: SynapseRequest,
+        allow_guest: bool = False,
+        allow_expired: bool = False,
+        allow_locked: bool = False,
+    ) -> Requester:
+        """Get a registered user's ID. See `Auth.get_user_by_req`."""
+        raise NotImplementedError()
+
+    async def get_optional_user_by_req(
+        self,
+        request: SynapseRequest,
+        allow_guest: bool = False,
+        allow_expired: bool = False,
+        allow_locked: bool = False,
+    ) -> Requester | None:
+        """Like `get_user_by_req`, except returns None when the request carries
+        no access token at all. A token that is present but invalid still
+        raises, as with `get_user_by_req`.
+
+        For endpoints where authentication is optional.
+        """
+        if not self.has_access_token(request):
+            return None
+
+        return await self.get_user_by_req(
+            request,
+            allow_guest=allow_guest,
+            allow_expired=allow_expired,
+            allow_locked=allow_locked,
+        )
 
     @staticmethod
     def has_access_token(request: Request) -> bool:
@@ -294,7 +352,7 @@ class BaseAuth:
     @cancellable
     async def get_appservice_user(
         self, request: Request, access_token: str
-    ) -> Optional[Requester]:
+    ) -> Requester | None:
         """
         Given a request, reads the request parameters to determine:
         - whether it's an application service that's making this request
@@ -302,11 +360,8 @@ class BaseAuth:
           (the user_id URI parameter allows an application service to masquerade
           any applicable user in its namespace)
         - what device the application service should be treated as controlling
-          (the device_id[^1] URI parameter allows an application service to masquerade
+          (the device_id URI parameter allows an application service to masquerade
           as any device that exists for the relevant user)
-
-        [^1] Unstable and provided by MSC3202.
-             Must use `org.matrix.msc3202.device_id` in place of `device_id` for now.
 
         Returns:
             the application service `Requester` of that request
@@ -319,8 +374,6 @@ class BaseAuth:
         - The returned device ID, if present, has been checked to be a valid device ID
           for the returned user ID.
         """
-        DEVICE_ID_ARG_NAME = b"org.matrix.msc3202.device_id"
-
         app_service = self.store.get_app_service_by_token(access_token)
         if app_service is None:
             return None
@@ -341,13 +394,9 @@ class BaseAuth:
         else:
             effective_user_id = app_service.sender
 
-        effective_device_id: Optional[str] = None
-
-        if (
-            self.hs.config.experimental.msc3202_device_masquerading_enabled
-            and DEVICE_ID_ARG_NAME in request.args
-        ):
-            effective_device_id = request.args[DEVICE_ID_ARG_NAME][0].decode("utf8")
+        effective_device_id_args = request.args.get(b"device_id")
+        if effective_device_id_args:
+            effective_device_id = effective_device_id_args[0].decode("utf8")
             # We only just set this so it can't be None!
             assert effective_device_id is not None
             device_opt = await self.store.get_device(
@@ -359,10 +408,27 @@ class BaseAuth:
                     f"Application service trying to use a device that doesn't exist ('{effective_device_id}' for {effective_user_id})",
                     Codes.UNKNOWN_DEVICE,
                 )
+        else:
+            effective_device_id = None
 
         return create_requester(
             effective_user_id, app_service=app_service, device_id=effective_device_id
         )
+
+    def assert_requester_has_scope(self, requester: Requester, scope: Scopes) -> None:
+        """Asserts that the requester has the given scope, either directly
+        (e.g. via an OAuth token) or via the scopes registered against the
+        application service.
+        """
+        if scope in requester.scope:
+            return
+
+        if requester.app_service_id is not None:
+            app_service = self.store.get_app_service_by_id(requester.app_service_id)
+            if app_service is not None and app_service.has_scope(scope):
+                return
+
+        raise AuthError(HTTPStatus.FORBIDDEN, f"Missing {scope} scope")
 
     async def _record_request(
         self, request: SynapseRequest, requester: Requester
@@ -373,7 +439,9 @@ class BaseAuth:
         """
         ip_addr = request.get_client_ip_if_available()
 
-        if ip_addr and (not requester.app_service or self._track_appservice_user_ips):
+        if ip_addr and (
+            not requester.app_service_id or self._track_appservice_user_ips
+        ):
             user_agent = get_request_user_agent(request)
             access_token = self.get_access_token_from_request(request)
 
@@ -383,7 +451,7 @@ class BaseAuth:
             # table during the transition
             recorded_device_id = (
                 "dummy-device"
-                if requester.device_id is None and requester.app_service is not None
+                if requester.device_id is None and requester.app_service_id is not None
                 else requester.device_id
             )
             await self.store.insert_client_ip(

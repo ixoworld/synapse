@@ -17,12 +17,12 @@
 # [This file includes modifications made by New Vector Limited]
 #
 #
-from typing import List
 from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
 from twisted.internet.testing import MemoryReactor
+from twisted.web.server import Site
 
 from synapse.app.generic_worker import GenericWorkerServer
 from synapse.app.homeserver import SynapseHomeServer
@@ -58,7 +58,7 @@ class FederationReaderOpenIDListenerTests(HomeserverTestCase):
             (["openid"], "auth_fail"),
         ]
     )
-    def test_openid_listener(self, names: List[str], expectation: str) -> None:
+    def test_openid_listener(self, names: list[str], expectation: str) -> None:
         """
         Test different openid listener configurations.
 
@@ -78,6 +78,7 @@ class FederationReaderOpenIDListenerTests(HomeserverTestCase):
 
         # Grab the resource from the site that was told to listen
         site = self.reactor.tcpServers[0][1]
+        assert isinstance(site, Site)
         try:
             site.resource.children[b"_matrix"].children[b"federation"]
         except KeyError:
@@ -106,7 +107,7 @@ class SynapseHomeserverOpenIDListenerTests(HomeserverTestCase):
             (["openid"], "auth_fail"),
         ]
     )
-    def test_openid_listener(self, names: List[str], expectation: str) -> None:
+    def test_openid_listener(self, names: list[str], expectation: str) -> None:
         """
         Test different openid listener configurations.
 
@@ -126,6 +127,7 @@ class SynapseHomeserverOpenIDListenerTests(HomeserverTestCase):
 
         # Grab the resource from the site that was told to listen
         site = self.reactor.tcpServers[0][1]
+        assert isinstance(site, Site)
         try:
             site.resource.children[b"_matrix"].children[b"federation"]
         except KeyError:

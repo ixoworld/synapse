@@ -20,7 +20,7 @@
 #
 import logging
 import os
-from typing import Any, Optional, Tuple
+from typing import Any
 
 from twisted.internet.protocol import Factory
 from twisted.internet.testing import MemoryReactor
@@ -44,7 +44,7 @@ from tests.unittest import override_config
 
 logger = logging.getLogger(__name__)
 
-test_server_connection_factory: Optional[TestServerTLSConnectionFactory] = None
+test_server_connection_factory: TestServerTLSConnectionFactory | None = None
 
 
 class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
@@ -67,7 +67,7 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         return conf
 
     def make_worker_hs(
-        self, worker_app: str, extra_config: Optional[dict] = None, **kwargs: Any
+        self, worker_app: str, extra_config: dict | None = None, **kwargs: Any
     ) -> HomeServer:
         worker_hs = super().make_worker_hs(worker_app, extra_config, **kwargs)
         # Force the media paths onto the replication resource.
@@ -78,7 +78,7 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
 
     def _get_media_req(
         self, hs: HomeServer, target: str, media_id: str
-    ) -> Tuple[FakeChannel, Request]:
+    ) -> tuple[FakeChannel, Request]:
         """Request some remote media from the given HS by calling the download
         API.
 
@@ -104,9 +104,7 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         (host, port, client_factory, _timeout, _bindAddress) = clients.pop()
 
         # build the test server
-        server_factory = Factory.forProtocol(HTTPChannel)
-        # Request.finish expects the factory to have a 'log' method.
-        server_factory.log = _log_request
+        server_factory = _HTTPFactory()
 
         server_tls_protocol = wrap_server_factory_for_tls(
             server_factory, self.reactor, sanlist=[b"DNS:example.com"]
@@ -120,6 +118,7 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         # Normally this would be done by the TCP socket code in Twisted, but we are
         # stubbing that out here.
         client_protocol = client_factory.buildProtocol(None)
+        assert client_protocol is not None
         client_protocol.makeConnection(
             FakeTransport(server_tls_protocol, self.reactor, client_protocol)
         )
@@ -130,7 +129,8 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         )
 
         # fish the test server back out of the server-side TLS protocol.
-        http_server: HTTPChannel = server_tls_protocol.wrappedProtocol
+        http_server = server_tls_protocol.wrappedProtocol
+        assert isinstance(http_server, HTTPChannel)
 
         # give the reactor a pump to get the TLS juices flowing.
         self.reactor.pump((0.1,))
@@ -205,6 +205,53 @@ class MediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
 
         # We expect only one new file to have been persisted.
         self.assertEqual(start_count + 1, self._count_remote_media())
+
+    @override_config(
+        {"enable_authenticated_media": False, "enable_local_media_storage": False}
+    )
+    def test_download_simple_file_race_no_local_storage(self) -> None:
+        """Test that fetching remote media works when local storage is disabled.
+
+        This test verifies that the system handles the case where local storage
+        is disabled. Without storage providers configured, the media cannot be
+        retrieved, but the important thing is that the race condition is still
+        handled correctly.
+        """
+        hs1 = self.make_worker_hs("synapse.app.generic_worker")
+        hs2 = self.make_worker_hs("synapse.app.generic_worker")
+
+        start_count = self._count_remote_media()
+
+        # Make two requests without responding to the outbound media requests.
+        channel1, request1 = self._get_media_req(hs1, "example.com:443", "ABC123")
+        channel2, request2 = self._get_media_req(hs2, "example.com:443", "ABC123")
+
+        # Respond to the first outbound media request and check that the client
+        # request is successful
+        request1.setResponseCode(200)
+        request1.responseHeaders.setRawHeaders(b"Content-Type", [b"text/plain"])
+        request1.write(b"Hello!")
+        request1.finish()
+
+        self.pump(0.1)
+
+        # With local storage disabled and no storage providers,
+        # we expect a 404 error
+        self.assertEqual(channel1.code, 404, channel1.result["body"])
+
+        # Now respond to the second with the same content.
+        request2.setResponseCode(200)
+        request2.responseHeaders.setRawHeaders(b"Content-Type", [b"text/plain"])
+        request2.write(b"Hello!")
+        request2.finish()
+
+        self.pump(0.1)
+
+        # Same for the second request
+        self.assertEqual(channel2.code, 404, channel2.result["body"])
+
+        # No files should be stored locally
+        self.assertEqual(start_count, self._count_remote_media())
 
     @override_config({"enable_authenticated_media": False})
     def test_download_image_race(self) -> None:
@@ -282,7 +329,7 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         return conf
 
     def make_worker_hs(
-        self, worker_app: str, extra_config: Optional[dict] = None, **kwargs: Any
+        self, worker_app: str, extra_config: dict | None = None, **kwargs: Any
     ) -> HomeServer:
         worker_hs = super().make_worker_hs(worker_app, extra_config, **kwargs)
         # Force the media paths onto the replication resource.
@@ -293,7 +340,7 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
 
     def _get_media_req(
         self, hs: HomeServer, target: str, media_id: str
-    ) -> Tuple[FakeChannel, Request]:
+    ) -> tuple[FakeChannel, Request]:
         """Request some remote media from the given HS by calling the download
         API.
 
@@ -319,9 +366,7 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         (host, port, client_factory, _timeout, _bindAddress) = clients.pop()
 
         # build the test server
-        server_factory = Factory.forProtocol(HTTPChannel)
-        # Request.finish expects the factory to have a 'log' method.
-        server_factory.log = _log_request
+        server_factory = _HTTPFactory()
 
         server_tls_protocol = wrap_server_factory_for_tls(
             server_factory, self.reactor, sanlist=[b"DNS:example.com"]
@@ -335,6 +380,7 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         # Normally this would be done by the TCP socket code in Twisted, but we are
         # stubbing that out here.
         client_protocol = client_factory.buildProtocol(None)
+        assert client_protocol is not None
         client_protocol.makeConnection(
             FakeTransport(server_tls_protocol, self.reactor, client_protocol)
         )
@@ -345,7 +391,8 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         )
 
         # fish the test server back out of the server-side TLS protocol.
-        http_server: HTTPChannel = server_tls_protocol.wrappedProtocol
+        http_server = server_tls_protocol.wrappedProtocol
+        assert isinstance(http_server, HTTPChannel)
 
         # give the reactor a pump to get the TLS juices flowing.
         self.reactor.pump((0.1,))
@@ -428,6 +475,53 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         # We expect only one new file to have been persisted.
         self.assertEqual(start_count + 1, self._count_remote_media())
 
+    @override_config({"enable_local_media_storage": False})
+    def test_download_simple_file_race_no_local_storage(self) -> None:
+        """Test that fetching remote media works when local storage is disabled.
+
+        When enable_local_media_storage is False, files should only be stored in
+        the storage providers and not in the local filesystem.
+        """
+        hs1 = self.make_worker_hs("synapse.app.generic_worker")
+        hs2 = self.make_worker_hs("synapse.app.generic_worker")
+
+        start_count = self._count_remote_media()
+
+        # Make two requests without responding to the outbound media requests.
+        channel1, request1 = self._get_media_req(hs1, "example.com:443", "ABC123")
+        channel2, request2 = self._get_media_req(hs2, "example.com:443", "ABC123")
+
+        # Respond to the first outbound media request and check that the client
+        # request is successful
+        request1.setResponseCode(200)
+        request1.responseHeaders.setRawHeaders(
+            b"Content-Type",
+            ["multipart/mixed; boundary=6067d4698f8d40a0a794ea7d7379d53a"],
+        )
+        request1.write(self.file_data)
+        request1.finish()
+
+        self.pump(0.1)
+        # With local storage disabled and no storage providers,
+        # we expect a 404 error
+        self.assertEqual(channel1.code, 404, channel1.result["body"])
+
+        # Now respond to the second with the same content.
+        request2.setResponseCode(200)
+        request2.responseHeaders.setRawHeaders(
+            b"Content-Type",
+            ["multipart/mixed; boundary=6067d4698f8d40a0a794ea7d7379d53a"],
+        )
+        request2.write(self.file_data)
+        request2.finish()
+
+        self.pump(0.1)
+
+        self.assertEqual(channel2.code, 404, channel2.result["body"])
+
+        # With local storage disabled, no files should be stored locally
+        self.assertEqual(start_count, self._count_remote_media())
+
     def test_download_image_race(self) -> None:
         """Test that fetching remote *images* from two different processes at
         the same time works.
@@ -491,6 +585,9 @@ class AuthenticatedMediaRepoShardTestCase(BaseMultiWorkerStreamTestCase):
         return sum(len(files) for _, _, files in os.walk(path))
 
 
-def _log_request(request: Request) -> None:
-    """Implements Factory.log, which is expected by Request.finish"""
-    logger.info("Completed request %s", request)
+class _HTTPFactory(Factory):
+    protocol = HTTPChannel
+
+    def log(self, request: Request) -> None:
+        """Request.finish expects the factory to have a 'log' method."""
+        logger.info("Completed request %s", request)
