@@ -40,7 +40,7 @@ from synapse.appservice.scheduler import (
 from synapse.events import EventBase
 from synapse.logging.context import make_deferred_yieldable
 from synapse.server import HomeServer
-from synapse.types import DeviceListUpdates, JsonDict
+from synapse.types import DeviceListUpdates, JsonDict, UserID
 from synapse.util.clock import Clock
 
 from tests import unittest
@@ -165,6 +165,150 @@ class ApplicationServiceSchedulerTransactionCtrlTestCase(unittest.TestCase):
             service,
             ApplicationServiceState.DOWN,  # service marked as down
         )
+
+    def test_single_service_down_without_recoverer_starts_one(self) -> None:
+        # IXO-PATCH(as-self-heal): the AS was marked DOWN by another process (e.g.
+        # the old pod during a rolling restart), so this process has no recoverer
+        # for it. Sending to it must start one, once.
+        service = Mock(id="as1")
+        events = [Mock(), Mock()]
+        txn = Mock(id="idhere", service=service, events=events)
+        self.store.get_appservice_state = AsyncMock(
+            return_value=ApplicationServiceState.DOWN
+        )
+        self.store.create_appservice_txn = AsyncMock(return_value=txn)
+
+        delivered = self.successResultOf(
+            defer.ensureDeferred(self.txnctrl.send(service, events))
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(0, txn.send.call_count)  # still not sent: the recoverer will
+        self.assertEqual(1, self.recoverer_fn.call_count)  # recoverer made
+        self.assertEqual(1, self.recoverer.recover.call_count)  # and started
+        self.assertTrue(self.txnctrl.is_recovering(service))
+
+        # Sending again while the recoverer runs does not start another one.
+        self.successResultOf(defer.ensureDeferred(self.txnctrl.send(service, events)))
+        self.assertEqual(1, self.recoverer_fn.call_count)
+        self.assertEqual(1, self.recoverer.recover.call_count)
+
+    def test_start_recoverer_is_idempotent(self) -> None:
+        # IXO-PATCH(as-self-heal): upstream asserted here (#20454).
+        service = Mock(id="as1")
+        self.txnctrl.start_recoverer(service)
+        self.txnctrl.start_recoverer(service)
+
+        self.assertEqual(1, self.recoverer_fn.call_count)
+        self.assertEqual(1, self.recoverer.recover.call_count)
+        self.assertEqual(1, len(self.txnctrl.recoverers))
+
+
+class ApplicationServiceSchedulerDownStateTestCase(unittest.HomeserverTestCase):
+    """IXO-PATCH(as-self-heal): an appservice marked DOWN in the database by another
+    process recovers by itself, through the periodic check.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.service = ApplicationService(
+            token="as_token",
+            id="as1",
+            sender=UserID.from_string("@as:test"),
+            url="http://as.test",
+            hs_token="hs_token",
+        )
+        self.store.get_app_services = Mock(  # type: ignore[method-assign]
+            return_value=[self.service]
+        )
+        self.push_bulk = AsyncMock(return_value=True)
+        hs.get_application_service_api().push_bulk = self.push_bulk  # type: ignore[method-assign]
+        self.scheduler = hs.get_application_service_scheduler()
+
+    def _state(self) -> ApplicationServiceState | None:
+        return self.get_success(self.store.get_appservice_state(self.service))
+
+    def test_down_written_by_another_process_recovers(self) -> None:
+        # The scheduler started while the AS was up: no recoverer.
+        self.get_success(self.scheduler.start())
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+        # Another process then fails a transaction: it stores it and marks the AS
+        # DOWN. Upstream, nothing in this process would ever retry it.
+        txn = self.get_success(
+            self.store.create_appservice_txn(
+                self.service, [], [], [], {}, {}, DeviceListUpdates()
+            )
+        )
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+        # The periodic check starts a recoverer within a minute...
+        self._advance_until_recovering()
+        self.push_bulk.assert_not_called()
+
+        # ...which sends the stored transaction after its first back-off and marks
+        # the AS up again.
+        self.reactor.advance(2)
+        self.push_bulk.assert_called_once()
+        self.assertEqual(self.push_bulk.call_args.kwargs["txn_id"], txn.id)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.assertIsNone(
+            self.get_success(self.store.get_oldest_unsent_txn(self.service))
+        )
+
+    def _advance_until_recovering(self) -> None:
+        for _ in range(61):
+            if self.scheduler.is_recovering(self.service):
+                return
+            self.reactor.advance(1)
+        self.fail("No recoverer was started within a minute")
+
+    def test_periodic_check_keeps_retrying_until_up(self) -> None:
+        self.push_bulk.return_value = False
+        self.get_success(
+            self.store.create_appservice_txn(
+                self.service, [], [], [], {}, {}, DeviceListUpdates()
+            )
+        )
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self._advance_until_recovering()
+
+        # The recoverer keeps backing off; later checks do not start a second one.
+        recoverer = self.scheduler.txn_ctrl.recoverers[self.service.id]
+        self.reactor.advance(300)
+        self.assertIs(self.scheduler.txn_ctrl.recoverers[self.service.id], recoverer)
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
+
+        self.push_bulk.return_value = True
+        self.reactor.advance(600)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+    def test_up_service_is_left_alone(self) -> None:
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.UP)
+        )
+        self.reactor.advance(600)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.push_bulk.assert_not_called()
+
+    @unittest.override_config({"notify_appservices_from_worker": "appservice_worker"})
+    def test_only_the_sending_process_checks(self) -> None:
+        # This process does not send appservice transactions: it must not retry.
+        self.assertFalse(self.hs.config.worker.should_notify_appservices)
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self.reactor.advance(600)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.push_bulk.assert_not_called()
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
 
 
 class ApplicationServiceSchedulerRecovererTestCase(unittest.HomeserverTestCase):

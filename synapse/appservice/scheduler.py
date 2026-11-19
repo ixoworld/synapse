@@ -94,6 +94,10 @@ MAX_EPHEMERAL_EVENTS_PER_TRANSACTION = 100
 # Maximum number of to-device messages to provide in an AS transaction.
 MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION = 100
 
+# IXO-PATCH(as-self-heal): how often the process that sends appservice transactions
+# looks in the database for appservices marked DOWN that it has no recoverer for.
+RECOVER_DOWN_SERVICES_INTERVAL = Duration(seconds=60)
+
 
 class ApplicationServiceScheduler:
     """
@@ -107,16 +111,51 @@ class ApplicationServiceScheduler:
         self.store = hs.get_datastores().main
         self.queuer = _ServiceQueuer(self.txn_ctrl, hs)
 
+        # IXO-PATCH(as-self-heal): the DOWN state of an appservice lives in the
+        # database, but recoverers live in the process that sends transactions, and
+        # `start()` only looks for DOWN services once. A DOWN written after that by
+        # another process (for example the old pod during a rolling restart) would
+        # otherwise never be retried. Only the process that sends appservice
+        # transactions runs this check.
+        if hs.config.worker.should_notify_appservices:
+            hs.get_clock().looping_call(
+                hs.run_as_background_process,
+                RECOVER_DOWN_SERVICES_INTERVAL,
+                desc="as_recover_down_services",
+                func=self.start_recoverers_for_down_services,
+            )
+
     async def start(self) -> None:
         logger.info("Starting appservice scheduler")
 
         # check for any DOWN ASes and start recoverers for them.
+        await self.start_recoverers_for_down_services()
+
+    async def start_recoverers_for_down_services(self) -> None:
+        """IXO-PATCH(as-self-heal): start a recoverer for every appservice that the
+        database marks DOWN and that has no recoverer in this process yet.
+        """
+        if not self.store.get_app_services():
+            return
+
         services = await self.store.get_appservices_by_state(
             ApplicationServiceState.DOWN
         )
 
         for service in services:
+            if self.txn_ctrl.is_recovering(service):
+                continue
+            logger.warning(
+                "AS ID %s is marked down but this process has no recoverer for it",
+                service.id,
+            )
             self.txn_ctrl.start_recoverer(service)
+
+    def is_recovering(self, service: ApplicationService) -> bool:
+        """IXO-PATCH(as-self-heal): whether this process is retrying transactions
+        for the given service, i.e. it cannot take new transactions right now.
+        """
+        return self.txn_ctrl.is_recovering(service)
 
     def enqueue_for_appservice(
         self,
@@ -389,7 +428,21 @@ class _TransactionController:
             device_list_summary: The device list summary to include in the transaction.
         """
         try:
-            service_is_up = await self._is_service_up(service)
+            state = await self.store.get_appservice_state(service)
+            service_is_up = state == ApplicationServiceState.UP or state is None
+
+            # IXO-PATCH(as-self-heal): the service may have been marked DOWN by
+            # another process (for example the old pod during a rolling restart).
+            # Nothing in this process would ever retry it: start a recoverer here.
+            if state == ApplicationServiceState.DOWN and not self.is_recovering(
+                service
+            ):
+                logger.warning(
+                    "AS ID %s is marked down but this process has no recoverer for it",
+                    service.id,
+                )
+                self.start_recoverer(service)
+
             # Don't create empty txns when in recovery mode (ephemeral events are dropped)
             if not service_is_up and not events:
                 return
@@ -436,8 +489,14 @@ class _TransactionController:
         Args:
             service:
         """
+        # IXO-PATCH(as-self-heal): idempotent. A failed send, `start()`, `send()`
+        # and the periodic check can all ask for a recoverer for the same service
+        # (upstream #20454 / #20458 asserted here).
+        if self.is_recovering(service):
+            logger.debug("AS ID %s already has a recoverer", service.id)
+            return
+
         logger.info("Starting recoverer for AS ID %s", service.id)
-        assert service.id not in self.recoverers
         recoverer = self.RECOVERER_CLASS(
             self.server_name,
             self.clock,
@@ -465,9 +524,11 @@ class _TransactionController:
 
         recoverer.force_retry()
 
-    async def _is_service_up(self, service: ApplicationService) -> bool:
-        state = await self.store.get_appservice_state(service)
-        return state == ApplicationServiceState.UP or state is None
+    def is_recovering(self, service: ApplicationService) -> bool:
+        """IXO-PATCH(as-self-heal): whether this process has a recoverer for the
+        given service.
+        """
+        return service.id in self.recoverers
 
 
 class _Recoverer:
