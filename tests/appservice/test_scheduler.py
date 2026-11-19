@@ -40,7 +40,7 @@ from synapse.appservice.scheduler import (
 from synapse.events import EventBase
 from synapse.logging.context import make_deferred_yieldable
 from synapse.server import HomeServer
-from synapse.types import DeviceListUpdates, JsonDict
+from synapse.types import DeviceListUpdates, JsonDict, UserID
 from synapse.util.clock import Clock
 
 from tests import unittest
@@ -165,6 +165,369 @@ class ApplicationServiceSchedulerTransactionCtrlTestCase(unittest.TestCase):
             service,
             ApplicationServiceState.DOWN,  # service marked as down
         )
+
+    def test_send_reports_delivery(self) -> None:
+        # IXO-PATCH(as-to-device): `send` says whether the txn was delivered.
+        service = Mock(id="as1")
+        txn = Mock(id="txn1", service=service, events=[])
+        txn.complete = AsyncMock(return_value=None)
+        self.store.get_appservice_state = AsyncMock(
+            return_value=ApplicationServiceState.UP
+        )
+        self.store.set_appservice_state = AsyncMock(return_value=None)
+        self.store.create_appservice_txn = AsyncMock(return_value=txn)
+
+        txn.send = AsyncMock(return_value=True)
+        self.assertTrue(
+            self.successResultOf(defer.ensureDeferred(self.txnctrl.send(service, [])))
+        )
+
+        txn.send = AsyncMock(return_value=False)
+        self.assertFalse(
+            self.successResultOf(defer.ensureDeferred(self.txnctrl.send(service, [])))
+        )
+
+    def test_single_service_down_without_recoverer_starts_one(self) -> None:
+        # IXO-PATCH(as-self-heal): the AS was marked DOWN by another process (e.g.
+        # the old pod during a rolling restart), so this process has no recoverer
+        # for it. Sending to it must start one, once.
+        service = Mock(id="as1")
+        events = [Mock(), Mock()]
+        txn = Mock(id="idhere", service=service, events=events)
+        self.store.get_appservice_state = AsyncMock(
+            return_value=ApplicationServiceState.DOWN
+        )
+        self.store.create_appservice_txn = AsyncMock(return_value=txn)
+
+        delivered = self.successResultOf(
+            defer.ensureDeferred(self.txnctrl.send(service, events))
+        )
+
+        self.assertFalse(delivered)
+        self.assertEqual(0, txn.send.call_count)  # still not sent: the recoverer will
+        self.assertEqual(1, self.recoverer_fn.call_count)  # recoverer made
+        self.assertEqual(1, self.recoverer.recover.call_count)  # and started
+        self.assertTrue(self.txnctrl.is_recovering(service))
+
+        # Sending again while the recoverer runs does not start another one.
+        self.successResultOf(defer.ensureDeferred(self.txnctrl.send(service, events)))
+        self.assertEqual(1, self.recoverer_fn.call_count)
+        self.assertEqual(1, self.recoverer.recover.call_count)
+
+    def test_start_recoverer_is_idempotent(self) -> None:
+        # IXO-PATCH(as-self-heal): upstream asserted here (#20454).
+        service = Mock(id="as1")
+        self.txnctrl.start_recoverer(service)
+        self.txnctrl.start_recoverer(service)
+
+        self.assertEqual(1, self.recoverer_fn.call_count)
+        self.assertEqual(1, self.recoverer.recover.call_count)
+        self.assertEqual(1, len(self.txnctrl.recoverers))
+
+    def test_on_recovered_reads_to_device_messages_again(self) -> None:
+        # IXO-PATCH(as-to-device): once the AS is back up, the to-device messages
+        # that could not be delivered while it was down are read again.
+        handler = Mock()
+        hs = Mock(
+            spec_set=[
+                "get_datastores",
+                "get_clock",
+                "get_application_service_api",
+                "get_application_service_handler",
+                "hostname",
+            ]
+        )
+        hs.get_clock.return_value = self.clock
+        hs.get_datastores.return_value = Mock(main=self.store)
+        hs.get_application_service_api.return_value = self.as_api
+        hs.get_application_service_handler.return_value = handler
+        txnctrl = _TransactionController(hs)
+        txnctrl.RECOVERER_CLASS = self.recoverer_fn
+        self.store.set_appservice_state = AsyncMock(return_value=None)
+
+        service = Mock(id="as1")
+        txnctrl.start_recoverer(service)
+        self.recoverer.service = service
+        self.successResultOf(defer.ensureDeferred(txnctrl.on_recovered(self.recoverer)))
+
+        self.store.set_appservice_state.assert_called_once_with(
+            service, ApplicationServiceState.UP
+        )
+        handler.notify_to_device_catch_up.assert_called_once_with(service)
+        self.assertFalse(txnctrl.is_recovering(service))
+
+
+class ApplicationServiceSchedulerDownStateTestCase(unittest.HomeserverTestCase):
+    """IXO-PATCH(as-self-heal): an appservice marked DOWN in the database by another
+    process recovers by itself, through the periodic check.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.service = ApplicationService(
+            token="as_token",
+            id="as1",
+            sender=UserID.from_string("@as:test"),
+            url="http://as.test",
+            hs_token="hs_token",
+        )
+        self.store.get_app_services = Mock(  # type: ignore[method-assign]
+            return_value=[self.service]
+        )
+        self.push_bulk = AsyncMock(return_value=True)
+        hs.get_application_service_api().push_bulk = self.push_bulk  # type: ignore[method-assign]
+        self.scheduler = hs.get_application_service_scheduler()
+
+    def _state(self) -> ApplicationServiceState | None:
+        return self.get_success(self.store.get_appservice_state(self.service))
+
+    def test_down_written_by_another_process_recovers(self) -> None:
+        # The scheduler started while the AS was up: no recoverer.
+        self.get_success(self.scheduler.start())
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+        # Another process then fails a transaction: it stores it and marks the AS
+        # DOWN. Upstream, nothing in this process would ever retry it.
+        txn = self.get_success(
+            self.store.create_appservice_txn(
+                self.service, [], [], [], {}, {}, DeviceListUpdates()
+            )
+        )
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+        # The periodic check starts a recoverer within a minute...
+        self._advance_until_recovering()
+        self.push_bulk.assert_not_called()
+
+        # ...which sends the stored transaction after its first back-off and marks
+        # the AS up again.
+        self.reactor.advance(2)
+        self.push_bulk.assert_called_once()
+        self.assertEqual(self.push_bulk.call_args.kwargs["txn_id"], txn.id)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.assertIsNone(
+            self.get_success(self.store.get_oldest_unsent_txn(self.service))
+        )
+
+    def _advance_until_recovering(self) -> None:
+        for _ in range(61):
+            if self.scheduler.is_recovering(self.service):
+                return
+            self.reactor.advance(1)
+        self.fail("No recoverer was started within a minute")
+
+    def test_periodic_check_keeps_retrying_until_up(self) -> None:
+        self.push_bulk.return_value = False
+        self.get_success(
+            self.store.create_appservice_txn(
+                self.service, [], [], [], {}, {}, DeviceListUpdates()
+            )
+        )
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self._advance_until_recovering()
+
+        # The recoverer keeps backing off; later checks do not start a second one.
+        recoverer = self.scheduler.txn_ctrl.recoverers[self.service.id]
+        self.reactor.advance(300)
+        self.assertIs(self.scheduler.txn_ctrl.recoverers[self.service.id], recoverer)
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
+
+        self.push_bulk.return_value = True
+        self.reactor.advance(600)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+
+    def test_up_service_is_left_alone(self) -> None:
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.UP)
+        )
+        self.reactor.advance(600)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.push_bulk.assert_not_called()
+
+    @unittest.override_config({"notify_appservices_from_worker": "appservice_worker"})
+    def test_only_the_sending_process_checks(self) -> None:
+        # This process does not send appservice transactions: it must not retry.
+        self.assertFalse(self.hs.config.worker.should_notify_appservices)
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        self.reactor.advance(600)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.push_bulk.assert_not_called()
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
+
+
+class ApplicationServiceSchedulerToDevicePositionTestCase(unittest.HomeserverTestCase):
+    """IXO-PATCH(as-to-device): the to-device stream position of an appservice is
+    stored only once the to-device messages up to it have been delivered.
+    """
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.service = ApplicationService(
+            token="as_token",
+            id="as1",
+            sender=UserID.from_string("@as:test"),
+            url="http://as.test",
+            hs_token="hs_token",
+            supports_ephemeral=True,
+        )
+        self.scheduler = ApplicationServiceScheduler(hs)
+        self.txn_ctrl = Mock()
+        self.txn_ctrl.send = AsyncMock(return_value=True)
+        self.scheduler.txn_ctrl = self.txn_ctrl
+        self.scheduler.queuer.txn_ctrl = self.txn_ctrl
+
+        self.handler = Mock()
+        hs.get_application_service_handler = Mock(  # type: ignore[method-assign]
+            return_value=self.handler
+        )
+
+    def _stored_pos(self) -> int:
+        # Let the sender finish its database writes first.
+        self.pump()
+        return self.get_success(
+            self.store.get_type_stream_id_for_appservice(self.service, "to_device")
+        )
+
+    def _enqueue(self, messages: list[JsonDict], pos: int) -> None:
+        _, generation = self.scheduler.get_to_device_queued_position(self.service)
+        self.scheduler.enqueue_to_device_messages(
+            self.service, messages, pos, generation
+        )
+        self.pump()
+
+    def _sent_to_device(self, call_index: int) -> list[JsonDict]:
+        return self.txn_ctrl.send.call_args_list[call_index][0][3]
+
+    def test_position_stored_only_after_delivery(self) -> None:
+        d: "defer.Deferred[bool]" = defer.Deferred()
+        self.txn_ctrl.send = Mock(return_value=make_deferred_yieldable(d))
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (None, 0)
+        )
+
+        self._enqueue([{"n": 1}, {"n": 2}], 10)
+        self.assertEqual(self._sent_to_device(0), [{"n": 1}, {"n": 2}])
+        # Queued up to 10 in this process, but not stored before delivery.
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (10, 0)
+        )
+        self.assertEqual(self._stored_pos(), 1)
+
+        d.callback(True)
+        self.assertEqual(self._stored_pos(), 10)
+
+    def test_undelivered_messages_are_read_again(self) -> None:
+        self.txn_ctrl.send = AsyncMock(return_value=False)
+
+        self._enqueue([{"n": 1}], 10)
+        self.assertEqual(self.txn_ctrl.send.call_count, 1)
+
+        # Not delivered: the position stays, and the next read starts from it.
+        self.assertEqual(self._stored_pos(), 1)
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (None, 1)
+        )
+
+        # A read that started before the messages were dropped is discarded, as it
+        # would skip them.
+        self.scheduler.enqueue_to_device_messages(self.service, [{"n": 2}], 12, 0)
+        self.assertEqual(self.txn_ctrl.send.call_count, 1)
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (None, 1)
+        )
+
+        # A read from the stored position goes out again, in order.
+        self.txn_ctrl.send = AsyncMock(return_value=True)
+        self._enqueue([{"n": 1}, {"n": 2}], 12)
+        self.assertEqual(self._sent_to_device(0), [{"n": 1}, {"n": 2}])
+        self.assertEqual(self._stored_pos(), 12)
+
+    def test_failure_mid_delivery_does_not_advance(self) -> None:
+        # 150 messages: two transactions. The first is delivered, the second not.
+        self.txn_ctrl.send = AsyncMock(side_effect=[True, False])
+        messages = [{"n": i} for i in range(150)]
+
+        self._enqueue(messages, 20)
+
+        self.assertEqual(self.txn_ctrl.send.call_count, 2)
+        self.assertEqual(self._sent_to_device(0), messages[:100])
+        self.assertEqual(self._sent_to_device(1), messages[100:])
+        # Nothing stored: the first 100 will be delivered again (duplicates are
+        # fine; losing the last 50 is not).
+        self.assertEqual(self._stored_pos(), 1)
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (None, 1)
+        )
+
+    def test_large_batch_stores_position_after_last_transaction(self) -> None:
+        d1: "defer.Deferred[bool]" = defer.Deferred()
+        d2: "defer.Deferred[bool]" = defer.Deferred()
+        results = [d1, d2]
+        self.txn_ctrl.send = Mock(
+            side_effect=lambda *args: make_deferred_yieldable(results.pop(0))
+        )
+        messages = [{"n": i} for i in range(150)]
+
+        self._enqueue(messages, 20)
+        d1.callback(True)
+        # The first 100 alone do not cover the read up to 20.
+        self.assertEqual(self._stored_pos(), 1)
+        d2.callback(True)
+        self.assertEqual(self._stored_pos(), 20)
+
+    def test_empty_read_stores_position_when_nothing_outstanding(self) -> None:
+        self._enqueue([], 30)
+        self.txn_ctrl.send.assert_not_called()
+        self.assertEqual(self._stored_pos(), 30)
+
+    def test_empty_read_waits_for_outstanding_delivery(self) -> None:
+        d: "defer.Deferred[bool]" = defer.Deferred()
+        self.txn_ctrl.send = Mock(return_value=make_deferred_yieldable(d))
+
+        self._enqueue([{"n": 1}], 10)
+        self._enqueue([], 15)
+        # 15 may only be stored once the message at or before 10 is delivered.
+        self.assertEqual(self._stored_pos(), 1)
+
+        d.callback(True)
+        self.assertEqual(self._stored_pos(), 15)
+        self.assertEqual(self.txn_ctrl.send.call_count, 1)
+
+    def test_read_continues_after_delivery_when_behind(self) -> None:
+        # The read stopped at 10 (batch limit) while the stream is at 50: once the
+        # batch is delivered, the next one is read.
+        self.store.get_to_device_stream_token = Mock(  # type: ignore[method-assign]
+            return_value=50
+        )
+        self._enqueue([{"n": 1}], 10)
+        self.handler.notify_to_device_catch_up.assert_called_once_with(self.service)
+
+    def test_no_continuation_when_caught_up(self) -> None:
+        self.store.get_to_device_stream_token = Mock(  # type: ignore[method-assign]
+            return_value=10
+        )
+        self._enqueue([{"n": 1}], 10)
+        self.handler.notify_to_device_catch_up.assert_not_called()
+        self.assertEqual(self._stored_pos(), 10)
+
+    def test_event_only_failure_keeps_to_device_position(self) -> None:
+        # A failed transaction without to-device messages drops nothing.
+        self._enqueue([], 10)
+        self.txn_ctrl.send = AsyncMock(return_value=False)
+        self.scheduler.enqueue_for_appservice(self.service, events=[Mock()])
+        self.assertEqual(
+            self.scheduler.get_to_device_queued_position(self.service), (10, 0)
+        )
+        self.assertEqual(self._stored_pos(), 10)
 
 
 class ApplicationServiceSchedulerRecovererTestCase(unittest.HomeserverTestCase):

@@ -40,6 +40,7 @@ import synapse.storage
 from synapse.api.constants import EduTypes, EventTypes, ReceiptTypes
 from synapse.appservice import (
     ApplicationService,
+    ApplicationServiceState,
     TransactionOneTimeKeysCount,
     TransactionUnusedFallbackKeys,
 )
@@ -1497,6 +1498,254 @@ class ApplicationServicesHandlerSendEventsTestCase(unittest.HomeserverTestCase):
         self._services.append(appservice)
 
         return appservice
+
+
+class ApplicationServicesHandlerToDeviceDeliveryTestCase(unittest.HomeserverTestCase):
+    """IXO-PATCH(as-to-device): to-device messages for an application service are not
+    lost when a transaction fails or the service is down. They are delivered once it
+    has recovered, in order, and the stored stream position only moves after
+    delivery.
+
+    Only the HTTP push is mocked: the real scheduler, transaction controller and
+    recoverer run.
+    """
+
+    servlets = [
+        synapse.rest.admin.register_servlets_for_client_rest_resource,
+        login.register_servlets,
+        sendtodevice.register_servlets,
+    ]
+
+    def default_config(self) -> JsonDict:
+        config = super().default_config()
+        # (`setdefault`, so that `override_config` can switch it off.)
+        config.setdefault("experimental_features", {}).setdefault(
+            "msc2409_to_device_messages_enabled", True
+        )
+        return config
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.scheduler = hs.get_application_service_scheduler()
+
+        # Results for the next pushes; True once the list is empty.
+        self.push_results: list[bool] = []
+        self.push_bulk = AsyncMock(
+            side_effect=lambda **kwargs: (
+                self.push_results.pop(0) if self.push_results else True
+            )
+        )
+        hs.get_application_service_api().push_bulk = self.push_bulk  # type: ignore[method-assign]
+
+        self.local_user = self.register_user("local_user", "password")
+        self.local_user_token = self.login("local_user", "password", "local_device")
+        self.as_user = self.register_user("as_user", "password")
+        self.as_user_device_id = "as_device"
+        self.login("as_user", "password", self.as_user_device_id)
+
+        self.service = ApplicationService(
+            token="as_token",
+            id="to_device_as",
+            sender=UserID.from_string("@as:test"),
+            namespaces={
+                ApplicationService.NS_USERS: [
+                    {"regex": "@as_user:.+", "exclusive": True}
+                ],
+            },
+            supports_ephemeral=True,
+            hs_token="abcde",
+            url="http://as.test",
+        )
+        self.services = [self.service]
+        self.store.get_app_services = Mock(  # type: ignore[method-assign]
+            return_value=self.services
+        )
+
+    def _send_to_device(self, n: int) -> None:
+        chan = self.make_request(
+            "PUT",
+            f"/_matrix/client/v3/sendToDevice/m.test/txn{n}",
+            content={"messages": {self.as_user: {self.as_user_device_id: {"n": n}}}},
+            access_token=self.local_user_token,
+        )
+        self.assertEqual(chan.code, 200, chan.result)
+        self.pump()
+
+    def _pushes(self, service: ApplicationService | None = None) -> list[list[int]]:
+        """The `n` of the to-device messages in each push to the service."""
+        service = service or self.service
+        return [
+            [
+                message["content"].get("n")
+                for message in call.kwargs["to_device_messages"]
+            ]
+            for call in self.push_bulk.call_args_list
+            if call.kwargs["service"] is service
+        ]
+
+    def _stored_pos(self, service: ApplicationService | None = None) -> int:
+        return self.get_success(
+            self.store.get_type_stream_id_for_appservice(
+                service or self.service, "to_device"
+            )
+        )
+
+    def _state(self) -> ApplicationServiceState | None:
+        return self.get_success(self.store.get_appservice_state(self.service))
+
+    def test_up_path_delivers_each_message_once(self) -> None:
+        self._send_to_device(1)
+        self._send_to_device(2)
+
+        self.assertEqual(self._pushes(), [[1], [2]])
+        message = self.push_bulk.call_args.kwargs["to_device_messages"][0]
+        self.assertEqual(message["to_user_id"], self.as_user)
+        self.assertEqual(message["to_device_id"], self.as_user_device_id)
+        self.assertEqual(message["sender"], self.local_user)
+        self.assertEqual(self._stored_pos(), self.store.get_to_device_stream_token())
+        self.assertNotEqual(self._state(), ApplicationServiceState.DOWN)
+
+    def test_messages_sent_while_down_are_delivered_after_recovery(self) -> None:
+        stored_before = self._stored_pos()
+
+        # The transaction carrying message 1 fails: the AS is marked down.
+        self.push_results = [False]
+        self._send_to_device(1)
+        self.assertEqual(self._pushes(), [[1]])
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
+        self.assertTrue(self.scheduler.is_recovering(self.service))
+        self.assertEqual(self._stored_pos(), stored_before)
+
+        # Messages sent while it is down are not pushed, and the position stays.
+        self._send_to_device(2)
+        self._send_to_device(3)
+        self.assertEqual(self._pushes(), [[1]])
+        self.assertEqual(self._stored_pos(), stored_before)
+
+        # The AS comes back: the recoverer re-sends the stored (event) transaction,
+        # then all three messages are delivered, in order.
+        self.reactor.advance(2)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertFalse(self.scheduler.is_recovering(self.service))
+        self.assertEqual(self._pushes(), [[1], [], [1, 2, 3]])
+        self.assertEqual(self._stored_pos(), self.store.get_to_device_stream_token())
+
+        # And afterwards the normal path carries on.
+        self._send_to_device(4)
+        self.assertEqual(self._pushes()[-1], [4])
+
+    def test_down_written_by_another_process(self) -> None:
+        # IXO-PATCH(as-self-heal) + (as-to-device): another process marked the AS
+        # down, so this process has no recoverer for it.
+        self.get_success(
+            self.store.set_appservice_state(self.service, ApplicationServiceState.DOWN)
+        )
+        stored_before = self._stored_pos()
+
+        self._send_to_device(1)
+        self.assertEqual(self._pushes(), [])
+        self.assertTrue(self.scheduler.is_recovering(self.service))
+        self.assertEqual(self._stored_pos(), stored_before)
+
+        self.reactor.advance(2)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        self.assertEqual(self._pushes(), [[1]])
+        self.assertEqual(self._stored_pos(), self.store.get_to_device_stream_token())
+
+    def test_failure_mid_delivery_does_not_advance_position(self) -> None:
+        # 149 messages share one stream id (one send to 149 devices), then one more:
+        # more than one transaction's worth.
+        fake_device_ids = [f"device_{i}" for i in range(149)]
+        self.get_success(
+            self.store.db_pool.simple_insert_many(
+                desc="test_failure_mid_delivery",
+                table="devices",
+                keys=("user_id", "device_id"),
+                values=[(self.as_user, device_id) for device_id in fake_device_ids],
+            )
+        )
+        self.get_success(
+            self.store.add_local_messages_from_client_to_device_inbox(
+                {
+                    self.as_user: {
+                        device_id: {
+                            "type": "m.test",
+                            "sender": self.local_user,
+                            "content": {"n": 0},
+                        }
+                        for device_id in fake_device_ids
+                    }
+                }
+            )
+        )
+        stored_before = self._stored_pos()
+
+        # The first transaction (100 messages) is delivered, the second is not.
+        self.push_results = [True, False]
+        self._send_to_device(1)
+        self.assertEqual([len(push) for push in self._pushes()], [100, 49])
+        self.assertEqual(self._state(), ApplicationServiceState.DOWN)
+        # Not moved past the undelivered messages (nor past the delivered ones,
+        # which come from the same read).
+        self.assertEqual(self._stored_pos(), stored_before)
+
+        # After recovery everything from the stored position is delivered again,
+        # in stream order: the 149 messages, then message 1.
+        self.reactor.advance(2)
+        self.assertEqual(self._state(), ApplicationServiceState.UP)
+        after = self._pushes()[2:]
+        self.assertEqual(after[0], [])  # the stored transaction
+        redelivered = [n for push in after[1:] for n in push]
+        self.assertEqual(redelivered, [0] * 149 + [1])
+        self.assertEqual(
+            sorted(
+                message["to_device_id"]
+                for call in self.push_bulk.call_args_list[3:]
+                for message in call.kwargs["to_device_messages"]
+                if message["content"]["n"] == 0
+            ),
+            sorted(fake_device_ids),
+        )
+        self.assertEqual(self._stored_pos(), self.store.get_to_device_stream_token())
+
+    def test_services_without_to_device_are_unaffected(self) -> None:
+        plain_service = ApplicationService(
+            token="plain_token",
+            id="plain_as",
+            sender=UserID.from_string("@plain:test"),
+            namespaces={
+                ApplicationService.NS_USERS: [
+                    {"regex": "@as_user:.+", "exclusive": False}
+                ],
+            },
+            hs_token="abcde",
+            url="http://plain.test",
+        )
+        self.services.append(plain_service)
+
+        self.push_results = [False]
+        self._send_to_device(1)
+        self.reactor.advance(2)
+
+        self.assertEqual(self._pushes(plain_service), [])
+        self.assertEqual(self._stored_pos(plain_service), 1)
+        self.assertIsNone(
+            self.get_success(self.store.get_appservice_state(plain_service))
+        )
+        self.assertEqual(self._pushes(), [[1], [], [1]])
+
+    @unittest.override_config(
+        {"experimental_features": {"msc2409_to_device_messages_enabled": False}}
+    )
+    def test_to_device_disabled(self) -> None:
+        self._send_to_device(1)
+        self.hs.get_application_service_handler().notify_to_device_catch_up(
+            self.service
+        )
+        self.pump()
+
+        self.push_bulk.assert_not_called()
+        self.assertEqual(self._stored_pos(), 1)
 
 
 class ApplicationServicesHandlerDeviceListsTestCase(unittest.HomeserverTestCase):

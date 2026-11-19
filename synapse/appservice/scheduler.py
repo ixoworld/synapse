@@ -94,6 +94,10 @@ MAX_EPHEMERAL_EVENTS_PER_TRANSACTION = 100
 # Maximum number of to-device messages to provide in an AS transaction.
 MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION = 100
 
+# IXO-PATCH(as-self-heal): how often the process that sends appservice transactions
+# looks in the database for appservices marked DOWN that it has no recoverer for.
+RECOVER_DOWN_SERVICES_INTERVAL = Duration(seconds=60)
+
 
 class ApplicationServiceScheduler:
     """
@@ -107,16 +111,109 @@ class ApplicationServiceScheduler:
         self.store = hs.get_datastores().main
         self.queuer = _ServiceQueuer(self.txn_ctrl, hs)
 
+        # IXO-PATCH(as-self-heal): the DOWN state of an appservice lives in the
+        # database, but recoverers live in the process that sends transactions, and
+        # `start()` only looks for DOWN services once. A DOWN written after that by
+        # another process (for example the old pod during a rolling restart) would
+        # otherwise never be retried. Only the process that sends appservice
+        # transactions runs this check.
+        if hs.config.worker.should_notify_appservices:
+            hs.get_clock().looping_call(
+                hs.run_as_background_process,
+                RECOVER_DOWN_SERVICES_INTERVAL,
+                desc="as_recover_down_services",
+                func=self.start_recoverers_for_down_services,
+            )
+
     async def start(self) -> None:
         logger.info("Starting appservice scheduler")
 
         # check for any DOWN ASes and start recoverers for them.
+        await self.start_recoverers_for_down_services()
+
+    async def start_recoverers_for_down_services(self) -> None:
+        """IXO-PATCH(as-self-heal): start a recoverer for every appservice that the
+        database marks DOWN and that has no recoverer in this process yet.
+        """
+        if not self.store.get_app_services():
+            return
+
         services = await self.store.get_appservices_by_state(
             ApplicationServiceState.DOWN
         )
 
         for service in services:
+            if self.txn_ctrl.is_recovering(service):
+                continue
+            logger.warning(
+                "AS ID %s is marked down but this process has no recoverer for it",
+                service.id,
+            )
             self.txn_ctrl.start_recoverer(service)
+
+    def is_recovering(self, service: ApplicationService) -> bool:
+        """IXO-PATCH(as-self-heal): whether this process is retrying transactions
+        for the given service, i.e. it cannot take new transactions right now.
+        """
+        return self.txn_ctrl.is_recovering(service)
+
+    def get_to_device_queued_position(
+        self, service: ApplicationService
+    ) -> tuple[int | None, int]:
+        """IXO-PATCH(as-to-device): where the next read of to-device messages for
+        this service should start.
+
+        Returns:
+            A tuple of:
+              * the to-device stream position up to which messages have been read
+                and queued in this process, or None if the read should start from the
+                position stored in the database (which only moves after delivery);
+              * the generation to pass to `enqueue_to_device_messages`.
+        """
+        return (
+            self.queuer.to_device_queued_pos.get(service.id),
+            self.queuer.to_device_generation.get(service.id, 0),
+        )
+
+    def enqueue_to_device_messages(
+        self,
+        appservice: ApplicationService,
+        to_device_messages: Collection[JsonMapping],
+        stream_pos: int,
+        generation: int,
+    ) -> None:
+        """IXO-PATCH(as-to-device): queue the to-device messages that were read for
+        this service up to `stream_pos` (inclusive).
+
+        `stream_pos` is stored in the database only once the transaction carrying the
+        last of these messages has been delivered. If undelivered to-device messages
+        were dropped since `get_to_device_queued_position` returned `generation`, the
+        read is discarded: the messages are read again from the stored position.
+
+        Args:
+            appservice: The application service the messages are for.
+            to_device_messages: The messages, in stream order. May be empty.
+            stream_pos: The to-device stream position the read covered.
+            generation: As returned by `get_to_device_queued_position` before the read.
+        """
+        queuer = self.queuer
+        if queuer.to_device_generation.get(appservice.id, 0) != generation:
+            logger.info(
+                "Discarding a to-device read for AS ID %s: undelivered messages were "
+                "dropped while it ran, they will be read again",
+                appservice.id,
+            )
+            return
+
+        if to_device_messages:
+            queuer.queued_to_device_messages.setdefault(appservice.id, []).extend(
+                to_device_messages
+            )
+        queuer.to_device_queued_pos[appservice.id] = stream_pos
+
+        # Also kicked off when there are no messages, so that the sender stores the
+        # new position once nothing for this service is outstanding.
+        queuer.start_background_request(appservice)
 
     def enqueue_for_appservice(
         self,
@@ -196,6 +293,20 @@ class _ServiceQueuer:
         self.hs = hs
         self._store = hs.get_datastores().main
 
+        # IXO-PATCH(as-to-device): to-device messages stay in `device_inbox`, so
+        # instead of storing the appservice's to-device stream position when they are
+        # read (and losing them if the transaction is not delivered), the position is
+        # stored once they have been delivered. Per service id:
+        #
+        # the to-device stream position up to which messages have been read and
+        # queued in this process (absent: read from the stored position);
+        self.to_device_queued_pos: dict[str, int] = {}
+        # bumped whenever undelivered to-device messages are dropped, so that a read
+        # which was running at that moment is discarded;
+        self.to_device_generation: dict[str, int] = {}
+        # the to-device stream position this process last stored in the database.
+        self._to_device_stored_pos: dict[str, int] = {}
+
     def start_background_request(self, service: ApplicationService) -> None:
         # start a sender for this appservice if we don't already have one
         if service.id in self.requests_in_flight:
@@ -226,6 +337,14 @@ class _ServiceQueuer:
                     :MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION
                 ]
                 del all_to_device_messages[:MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION]
+                # IXO-PATCH(as-to-device): when this transaction carries the last of the
+                # queued to-device messages, the queued position can be stored once it
+                # is delivered.
+                to_device_pos = (
+                    None
+                    if all_to_device_messages
+                    else self.to_device_queued_pos.get(service.id)
+                )
 
                 # Consolidate any pending device list summaries into a single, up-to-date
                 # summary.
@@ -256,27 +375,31 @@ class _ServiceQueuer:
                     # at least one entry, otherwise False
                     and not device_list_summary
                 ):
+                    # IXO-PATCH(as-to-device): every to-device message queued so far
+                    # has been delivered, so the queued position can be stored.
+                    await self._store_to_device_pos(service, to_device_pos)
                     return
 
                 one_time_keys_count: TransactionOneTimeKeysCount | None = None
                 unused_fallback_keys: TransactionUnusedFallbackKeys | None = None
 
-                if (
-                    self._msc3202_transaction_extensions_enabled
-                    and service.msc3202_transaction_extensions
-                ):
-                    # Compute the one-time key counts and fallback key usage states
-                    # for the users which are mentioned in this transaction,
-                    # as well as the appservice's sender.
-                    (
-                        one_time_keys_count,
-                        unused_fallback_keys,
-                    ) = await self._compute_msc3202_otk_counts_and_fallback_keys(
-                        service, events, ephemeral, to_device_messages_to_send
-                    )
-
+                delivered = False
                 try:
-                    await self.txn_ctrl.send(
+                    if (
+                        self._msc3202_transaction_extensions_enabled
+                        and service.msc3202_transaction_extensions
+                    ):
+                        # Compute the one-time key counts and fallback key usage states
+                        # for the users which are mentioned in this transaction,
+                        # as well as the appservice's sender.
+                        (
+                            one_time_keys_count,
+                            unused_fallback_keys,
+                        ) = await self._compute_msc3202_otk_counts_and_fallback_keys(
+                            service, events, ephemeral, to_device_messages_to_send
+                        )
+
+                    delivered = await self.txn_ctrl.send(
                         service,
                         events,
                         ephemeral,
@@ -287,8 +410,61 @@ class _ServiceQueuer:
                     )
                 except Exception:
                     logger.exception("AS request failed")
+
+                # IXO-PATCH(as-to-device): store the to-device position only after
+                # delivery; if to-device messages were not delivered, read them again
+                # from the stored position instead of losing them.
+                if delivered:
+                    await self._store_to_device_pos(service, to_device_pos)
+                    if (
+                        to_device_messages_to_send
+                        and to_device_pos is not None
+                        and to_device_pos < self._store.get_to_device_stream_token()
+                    ):
+                        # The read may have stopped early: fetch the next batch.
+                        self.hs.get_application_service_handler().notify_to_device_catch_up(
+                            service
+                        )
+                elif to_device_messages_to_send:
+                    self._drop_undelivered_to_device_messages(service)
         finally:
             self.requests_in_flight.discard(service.id)
+
+    async def _store_to_device_pos(
+        self, service: ApplicationService, pos: int | None
+    ) -> None:
+        """IXO-PATCH(as-to-device): store the to-device stream position up to which
+        all to-device messages for this service have been delivered.
+        """
+        if pos is None or pos <= self._to_device_stored_pos.get(service.id, 0):
+            return
+        try:
+            await self._store.set_appservice_stream_type_pos(service, "to_device", pos)
+        except Exception:
+            # Not stored: the messages may be delivered again after a restart.
+            logger.exception(
+                "Failed to store the to-device stream position for AS ID %s",
+                service.id,
+            )
+            return
+        self._to_device_stored_pos[service.id] = pos
+
+    def _drop_undelivered_to_device_messages(self, service: ApplicationService) -> None:
+        """IXO-PATCH(as-to-device): to-device messages for this service were not
+        delivered. Forget everything queued after the stored position, so that the
+        next read starts again from there (the messages are still in `device_inbox`).
+        """
+        dropped = len(self.queued_to_device_messages.pop(service.id, []))
+        self.to_device_queued_pos.pop(service.id, None)
+        self.to_device_generation[service.id] = (
+            self.to_device_generation.get(service.id, 0) + 1
+        )
+        logger.info(
+            "To-device messages for AS ID %s were not delivered (%i more were queued): "
+            "they will be read again from device_inbox",
+            service.id,
+            dropped,
+        )
 
     async def _compute_msc3202_otk_counts_and_fallback_keys(
         self,
@@ -372,7 +548,7 @@ class _TransactionController:
         one_time_keys_count: TransactionOneTimeKeysCount | None = None,
         unused_fallback_keys: TransactionUnusedFallbackKeys | None = None,
         device_list_summary: DeviceListUpdates | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Create a transaction with the given data and send to the provided
         application service.
@@ -387,12 +563,31 @@ class _TransactionController:
             unused_fallback_keys: Lists of unused fallback keys for relevant
                 appservice devices in the transaction.
             device_list_summary: The device list summary to include in the transaction.
+
+        Returns:
+            IXO-PATCH(as-to-device): True if the transaction was delivered to the
+            application service, False otherwise (including when the service is down
+            and the transaction was stored or dropped instead).
         """
         try:
-            service_is_up = await self._is_service_up(service)
+            state = await self.store.get_appservice_state(service)
+            service_is_up = state == ApplicationServiceState.UP or state is None
+
+            # IXO-PATCH(as-self-heal): the service may have been marked DOWN by
+            # another process (for example the old pod during a rolling restart).
+            # Nothing in this process would ever retry it: start a recoverer here.
+            if state == ApplicationServiceState.DOWN and not self.is_recovering(
+                service
+            ):
+                logger.warning(
+                    "AS ID %s is marked down but this process has no recoverer for it",
+                    service.id,
+                )
+                self.start_recoverer(service)
+
             # Don't create empty txns when in recovery mode (ephemeral events are dropped)
             if not service_is_up and not events:
-                return
+                return False
 
             txn = await self.store.create_appservice_txn(
                 service=service,
@@ -407,11 +602,13 @@ class _TransactionController:
                 sent = await txn.send(self.as_api)
                 if sent:
                     await txn.complete(self.store)
+                    return True
                 else:
                     run_in_background(self._on_txn_fail, service)
         except Exception:
             logger.exception("Error creating appservice transaction")
             run_in_background(self._on_txn_fail, service)
+        return False
 
     async def on_recovered(self, recoverer: "_Recoverer") -> None:
         logger.info(
@@ -421,6 +618,13 @@ class _TransactionController:
         logger.info("Remaining active recoverers: %s", len(self.recoverers))
         await self.store.set_appservice_state(
             recoverer.service, ApplicationServiceState.UP
+        )
+
+        # IXO-PATCH(as-to-device): stored transactions only keep room events. The
+        # to-device messages that could not be delivered while the service was down
+        # are still in `device_inbox` after the stored position: read them again.
+        self.hs.get_application_service_handler().notify_to_device_catch_up(
+            recoverer.service
         )
 
     async def _on_txn_fail(self, service: ApplicationService) -> None:
@@ -436,8 +640,14 @@ class _TransactionController:
         Args:
             service:
         """
+        # IXO-PATCH(as-self-heal): idempotent. A failed send, `start()`, `send()`
+        # and the periodic check can all ask for a recoverer for the same service
+        # (upstream #20454 / #20458 asserted here).
+        if self.is_recovering(service):
+            logger.debug("AS ID %s already has a recoverer", service.id)
+            return
+
         logger.info("Starting recoverer for AS ID %s", service.id)
-        assert service.id not in self.recoverers
         recoverer = self.RECOVERER_CLASS(
             self.server_name,
             self.clock,
@@ -465,9 +675,11 @@ class _TransactionController:
 
         recoverer.force_retry()
 
-    async def _is_service_up(self, service: ApplicationService) -> bool:
-        state = await self.store.get_appservice_state(service)
-        return state == ApplicationServiceState.UP or state is None
+    def is_recovering(self, service: ApplicationService) -> bool:
+        """IXO-PATCH(as-self-heal): whether this process has a recoverer for the
+        given service.
+        """
+        return service.id in self.recoverers
 
 
 class _Recoverer:

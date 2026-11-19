@@ -33,6 +33,7 @@ from twisted.internet import defer
 import synapse
 from synapse.api.constants import EduTypes, EventTypes
 from synapse.appservice import ApplicationService
+from synapse.appservice.scheduler import MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION
 from synapse.events import EventBase
 from synapse.handlers.presence import format_user_presence_state
 from synapse.logging.context import make_deferred_yieldable, run_in_background
@@ -402,19 +403,10 @@ class ApplicationServicesHandler:
 
                     elif stream_key == StreamKeyType.TO_DEVICE:
                         assert isinstance(new_token, int)
-                        # Retrieve a list of to-device message events, as well as the
-                        # maximum stream token of the messages we were able to retrieve.
-                        to_device_messages = await self._get_to_device_messages(
-                            service, new_token, users
-                        )
-                        self.scheduler.enqueue_for_appservice(
-                            service, to_device_messages=to_device_messages
-                        )
-
-                        # Persist the latest handled stream token for this appservice
-                        await self.store.set_appservice_stream_type_pos(
-                            service, "to_device", new_token
-                        )
+                        # IXO-PATCH(as-to-device): read and queue the to-device
+                        # messages. The scheduler stores the stream position only
+                        # once they have been delivered.
+                        await self._handle_to_device_messages(service, new_token)
 
                     elif stream_key == StreamKeyType.DEVICE_LIST:
                         assert isinstance(new_token, int)
@@ -581,75 +573,120 @@ class ApplicationServicesHandler:
 
         return events
 
+    def notify_to_device_catch_up(self, service: ApplicationService) -> None:
+        """IXO-PATCH(as-to-device): read the to-device messages for `service` that
+        have not been delivered yet, up to the current to-device stream position.
+
+        Called by the scheduler once the service has recovered, and after it has
+        delivered a batch of to-device messages while more may be waiting.
+        """
+        if not self.notify_appservices or not self._msc2409_to_device_messages_enabled:
+            return
+        if service.url is None or not (
+            service.supports_ephemeral or service.supports_unstable_ephemeral
+        ):
+            return
+
+        self._notify_interested_services_ephemeral(
+            [service],
+            StreamKeyType.TO_DEVICE,
+            self.store.get_to_device_stream_token(),
+            [],
+        )
+
+    async def _handle_to_device_messages(
+        self, service: ApplicationService, new_token: int
+    ) -> None:
+        """IXO-PATCH(as-to-device): read the next batch of to-device messages for the
+        given application service, up to `new_token`, and queue them.
+
+        Upstream stored `new_token` as soon as the messages were queued, so messages in
+        a transaction that was not delivered (or that were dropped because the service
+        was down) were never sent. Here the read starts where the previous read in this
+        process stopped, or at the position stored in the database (which the scheduler
+        only moves once the messages have been delivered).
+
+        Must be called under the `(service.id, StreamKeyType.TO_DEVICE)` linearizer.
+        """
+        if self.scheduler.is_recovering(service):
+            # The service cannot take transactions now. The messages stay in
+            # device_inbox and are read once it has recovered.
+            return
+
+        from_key, generation = self.scheduler.get_to_device_queued_position(service)
+        if from_key is None:
+            from_key = await self.store.get_type_stream_id_for_appservice(
+                service, "to_device"
+            )
+        if new_token <= from_key:
+            return
+
+        to_device_messages, reached_token = await self._get_to_device_messages(
+            service, from_key, new_token
+        )
+        self.scheduler.enqueue_to_device_messages(
+            service, to_device_messages, reached_token, generation
+        )
+
     async def _get_to_device_messages(
         self,
         service: ApplicationService,
+        from_key: int,
         new_token: int,
-        users: Collection[str | UserID],
-    ) -> list[JsonDict]:
+    ) -> tuple[list[JsonDict], int]:
         """
-        Given an application service, determine which events it should receive
-        from those between the last-recorded to-device message stream token for this
-        appservice and the given stream token.
+        Given an application service, determine which to-device messages it should
+        receive from those between the given stream tokens.
+
+        IXO-PATCH(as-to-device): the recipients are looked up for the whole range
+        rather than taken from the latest notification, so that a range which was not
+        delivered can be read again; and the read is bounded.
 
         Args:
             service: The application service to check for which events it should receive.
-            new_token: The latest to-device event stream token.
-            users: The users to be notified for the new to-device messages
-                (ie, the recipients of the messages).
+            from_key: The to-device stream token to read from (exclusive).
+            new_token: The latest to-device event stream token (inclusive).
 
         Returns:
-            A list of JSON dictionaries containing data derived from the to-device events
-                that should be sent to the given application service.
+            A tuple of:
+              * A list of JSON dictionaries containing data derived from the to-device
+                events that should be sent to the given application service, in stream
+                order;
+              * The stream token up to which messages were read. This is lower than
+                `new_token` when the read was cut off at about
+                MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION messages.
         """
-        # Get the stream token that this application service has processed up until
-        from_key = await self.store.get_type_stream_id_for_appservice(
-            service, "to_device"
-        )
-
         # Filter out users that this appservice is not interested in
-        users_appservice_is_interested_in: list[str] = []
-        for user in users:
-            # FIXME: We should do this farther up the call stack. We currently repeat
-            #  this operation in _handle_presence.
-            if isinstance(user, UserID):
-                user = user.to_string()
-
-            if service.is_interested_in_user(user):
-                users_appservice_is_interested_in.append(user)
+        recipients = await self.store.get_device_message_recipients(from_key, new_token)
+        users_appservice_is_interested_in = [
+            user_id for user_id in recipients if service.is_interested_in_user(user_id)
+        ]
 
         if not users_appservice_is_interested_in:
             # Return early if the AS was not interested in any of these users
-            return []
+            return [], new_token
 
-        # Retrieve the to-device messages for each user
-        recipient_device_to_messages = await self.store.get_messages_for_user_devices(
+        # Retrieve the to-device messages for these users, in stream order
+        messages, reached_token = await self.store.get_device_messages_in_range(
             users_appservice_is_interested_in,
             from_key,
             new_token,
+            limit=MAX_TO_DEVICE_MESSAGES_PER_TRANSACTION,
         )
 
         # According to MSC2409, we'll need to add 'to_user_id' and 'to_device_id' fields
         # to the event JSON so that the application service will know which user/device
         # combination this messages was intended for.
-        #
-        # So we mangle this dict into a flat list of to-device messages with the relevant
-        # user ID and device ID embedded inside each message dict.
-        message_payload: list[JsonDict] = []
-        for (
-            user_id,
-            device_id,
-        ), messages in recipient_device_to_messages.items():
-            for message_json in messages:
-                message_payload.append(
-                    {
-                        "to_user_id": user_id,
-                        "to_device_id": device_id,
-                        **message_json,
-                    }
-                )
+        message_payload: list[JsonDict] = [
+            {
+                "to_user_id": user_id,
+                "to_device_id": device_id,
+                **message_json,
+            }
+            for user_id, device_id, message_json in messages
+        ]
 
-        return message_payload
+        return message_payload, reached_token
 
     async def _get_device_list_summary(
         self,
