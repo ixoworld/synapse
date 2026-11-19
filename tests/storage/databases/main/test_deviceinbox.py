@@ -30,6 +30,7 @@ from synapse.server import HomeServer
 from synapse.storage.databases.main.deviceinbox import (
     DEVICE_FEDERATION_INBOX_CLEANUP_DELAY,
 )
+from synapse.util.caches.stream_change_cache import AllEntitiesChangedResult
 from synapse.util.clock import Clock
 
 from tests.unittest import HomeserverTestCase
@@ -320,4 +321,131 @@ class DeviceInboxFederationInboxCleanupTestCase(HomeserverTestCase):
             len(rows),
             0,
             "Expected all messages to be deleted after multiple batches",
+        )
+
+
+class DeviceInboxRangeReadTestCase(HomeserverTestCase):
+    """IXO-PATCH(as-to-device): the bounded reads used to re-read to-device messages
+    for application services.
+    """
+
+    servlets = [admin.register_servlets]
+
+    def prepare(self, reactor: MemoryReactor, clock: Clock, hs: HomeServer) -> None:
+        self.store = hs.get_datastores().main
+        self.user_1 = self.register_user("user_1", "pass")
+        self.user_2 = self.register_user("user_2", "pass")
+        self.user_3 = self.register_user("user_3", "pass")
+        devices = [(self.user_1, f"D1_{i}", False) for i in range(3)]
+        devices += [(self.user_2, "D2", False), (self.user_2, "D2_hidden", True)]
+        devices += [(self.user_3, "D3", False)]
+        self.get_success(
+            self.store.db_pool.simple_insert_many(
+                desc="devices",
+                table="devices",
+                keys=("user_id", "device_id", "hidden"),
+                values=devices,
+            )
+        )
+
+    def _send(self, recipients: dict[str, list[str]], n: int) -> int:
+        """Store one to-device message for the given devices; returns its stream id."""
+        return self.get_success(
+            self.store.add_local_messages_from_client_to_device_inbox(
+                {
+                    user_id: {
+                        device_id: {
+                            "type": "m.test",
+                            "sender": "@s:test",
+                            "content": {"n": n},
+                        }
+                        for device_id in device_ids
+                    }
+                    for user_id, device_ids in recipients.items()
+                }
+            )
+        )
+
+    def _read(
+        self, user_ids: list[str], from_id: int, to_id: int, limit: int
+    ) -> tuple[list[tuple[str, str, int]], int]:
+        messages, reached = self.get_success(
+            self.store.get_device_messages_in_range(user_ids, from_id, to_id, limit)
+        )
+        return [(u, d, m["content"]["n"]) for u, d, m in messages], reached
+
+    def test_stream_order_across_users(self) -> None:
+        s1 = self._send({self.user_1: ["D1_0"]}, 1)
+        self._send({self.user_3: ["D3"]}, 2)
+        s3 = self._send({self.user_2: ["D2"]}, 3)
+        s4 = self._send({self.user_1: ["D1_0"]}, 4)
+
+        messages, reached = self._read([self.user_1, self.user_2], s1 - 1, s4, 10)
+        self.assertEqual(
+            messages,
+            [
+                (self.user_1, "D1_0", 1),
+                (self.user_2, "D2", 3),
+                (self.user_1, "D1_0", 4),
+            ],
+        )
+        self.assertEqual(reached, s4)
+
+        # The lower bound is exclusive and the upper bound inclusive.
+        messages, reached = self._read([self.user_1, self.user_2], s1, s3, 10)
+        self.assertEqual(messages, [(self.user_2, "D2", 3)])
+        self.assertEqual(reached, s3)
+
+    def test_limit_does_not_split_a_stream_id(self) -> None:
+        s1 = self._send({self.user_1: ["D1_0"]}, 1)
+        s2 = self._send({self.user_1: ["D1_0", "D1_1", "D1_2"]}, 2)
+        s3 = self._send({self.user_1: ["D1_0"]}, 3)
+
+        # The limit (3) falls inside stream id s2: stop before it.
+        messages, reached = self._read([self.user_1], s1 - 1, s3, 3)
+        self.assertEqual(messages, [(self.user_1, "D1_0", 1)])
+        self.assertEqual(reached, s2 - 1)
+
+        # From there, s2 alone has more rows than the limit (2): all of them.
+        messages, reached = self._read([self.user_1], reached, s3, 2)
+        self.assertEqual(
+            sorted(messages), [(self.user_1, f"D1_{i}", 2) for i in range(3)]
+        )
+        self.assertEqual(reached, s2)
+
+        messages, reached = self._read([self.user_1], reached, s3, 2)
+        self.assertEqual(messages, [(self.user_1, "D1_0", 3)])
+        self.assertEqual(reached, s3)
+
+    def test_hidden_devices_are_skipped(self) -> None:
+        s1 = self._send({self.user_2: ["D2", "D2_hidden"]}, 1)
+        messages, reached = self._read([self.user_2], s1 - 1, s1, 10)
+        self.assertEqual(messages, [(self.user_2, "D2", 1)])
+        self.assertEqual(reached, s1)
+
+    def test_recipients(self) -> None:
+        s1 = self._send({self.user_1: ["D1_0"]}, 1)
+        s2 = self._send({self.user_2: ["D2"]}, 2)
+        s3 = self._send({self.user_3: ["D3"]}, 3)
+
+        # From the stream change cache (may include more users)...
+        self.assertTrue(
+            {self.user_2, self.user_3}.issubset(
+                self.get_success(self.store.get_device_message_recipients(s1, s3))
+            )
+        )
+        # ...and from the database when the cache does not go back far enough.
+        with patch.object(
+            self.store._device_inbox_stream_cache,
+            "get_all_entities_changed",
+            return_value=AllEntitiesChangedResult(None),
+        ):
+            self.assertEqual(
+                sorted(
+                    self.get_success(self.store.get_device_message_recipients(s1, s2))
+                ),
+                [self.user_2],
+            )
+        self.assertEqual(
+            self.get_success(self.store.get_device_message_recipients(s3, s3)), []
         )

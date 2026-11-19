@@ -464,6 +464,157 @@ class DeviceInboxWorkerStore(SQLBaseStore):
             "get_device_messages", get_device_messages_txn
         )
 
+    async def get_device_message_recipients(
+        self, from_stream_id: int, to_stream_id: int
+    ) -> Collection[str]:
+        """IXO-PATCH(as-to-device): get the local users that may have to-device
+        messages with `from_stream_id < stream_id <= to_stream_id`. Used to re-read
+        to-device messages for application services after a failed delivery.
+
+        May return users that have no messages in that range.
+
+        Args:
+            from_stream_id: The lower boundary of stream id (exclusive).
+            to_stream_id: The upper boundary of stream id (inclusive).
+
+        Returns:
+            The user IDs.
+        """
+        if from_stream_id >= to_stream_id:
+            return []
+
+        changed = self._device_inbox_stream_cache.get_all_entities_changed(
+            from_stream_id
+        )
+        if changed.hit:
+            return changed.entities
+
+        def get_device_message_recipients_txn(txn: LoggingTransaction) -> list[str]:
+            txn.execute(
+                """
+                SELECT DISTINCT user_id FROM device_inbox
+                WHERE ? < stream_id AND stream_id <= ?
+                """,
+                (from_stream_id, to_stream_id),
+            )
+            return [row[0] for row in txn]
+
+        return await self.db_pool.runInteraction(
+            "get_device_message_recipients", get_device_message_recipients_txn
+        )
+
+    async def get_device_messages_in_range(
+        self,
+        user_ids: Collection[str],
+        from_stream_id: int,
+        to_stream_id: int,
+        limit: int,
+    ) -> tuple[list[tuple[str, str, JsonDict]], int]:
+        """IXO-PATCH(as-to-device): get the to-device messages for the (non-hidden)
+        devices of the given users with `from_stream_id < stream_id <= to_stream_id`,
+        in stream order, reading about `limit` messages at most.
+
+        Messages that share a stream id (one message sent to several devices) are never
+        split up. If the first stream id alone has more than `limit` messages, all of
+        them are returned.
+
+        Args:
+            user_ids: The users to get messages for.
+            from_stream_id: The lower boundary of stream id (exclusive).
+            to_stream_id: The upper boundary of stream id (inclusive).
+            limit: The number of messages to stop at.
+
+        Returns:
+            A tuple of:
+              * a list of (user ID, device ID, message) tuples, in stream order;
+              * the stream id up to which all messages were returned. If this is lower
+                than `to_stream_id`, call again from it to get the next messages.
+        """
+        user_ids_to_query = {
+            user_id
+            for user_id in user_ids
+            if self._device_inbox_stream_cache.has_entity_changed(
+                user_id, from_stream_id
+            )
+        }
+        if not user_ids_to_query or from_stream_id >= to_stream_id:
+            return [], to_stream_id
+
+        def get_device_messages_in_range_txn(
+            txn: LoggingTransaction,
+        ) -> tuple[list[tuple[str, str, JsonDict]], int]:
+            # As in `_get_device_messages`: hidden devices do not get to-device
+            # messages, and filtering on device IDs uses the
+            # (user_id, device_id, stream_id) index.
+            user_device_rows = cast(
+                list[tuple[str]],
+                self.db_pool.simple_select_many_txn(
+                    txn,
+                    table="devices",
+                    column="user_id",
+                    iterable=user_ids_to_query,
+                    keyvalues={"hidden": False},
+                    retcols=("device_id",),
+                ),
+            )
+            device_ids_to_query = {row[0] for row in user_device_rows}
+            if not device_ids_to_query:
+                return [], to_stream_id
+
+            user_id_clause, user_id_args = make_in_list_sql_clause(
+                self.database_engine, "user_id", user_ids_to_query
+            )
+            device_id_clause, device_id_args = make_in_list_sql_clause(
+                self.database_engine, "device_id", device_ids_to_query
+            )
+            sql = f"""
+                SELECT stream_id, user_id, device_id, message_json FROM device_inbox
+                WHERE {user_id_clause} AND {device_id_clause}
+                AND ? < stream_id AND stream_id <= ?
+                ORDER BY stream_id ASC
+                LIMIT ?
+            """
+            txn.execute(
+                sql,
+                (*user_id_args, *device_id_args, from_stream_id, to_stream_id, limit),
+            )
+            rows = cast(list[tuple[int, str, str, str]], txn.fetchall())
+
+            if len(rows) < limit:
+                # Everything in the range was returned.
+                reached_stream_id = to_stream_id
+            else:
+                # The limit was hit, so the last stream id may have been cut off.
+                last_stream_id = rows[-1][0]
+                if rows[0][0] == last_stream_id:
+                    # All rows share one stream id: return all of its messages.
+                    txn.execute(
+                        f"""
+                        SELECT stream_id, user_id, device_id, message_json
+                        FROM device_inbox
+                        WHERE {user_id_clause} AND {device_id_clause}
+                        AND stream_id = ?
+                        """,
+                        (*user_id_args, *device_id_args, last_stream_id),
+                    )
+                    rows = cast(list[tuple[int, str, str, str]], txn.fetchall())
+                    reached_stream_id = last_stream_id
+                else:
+                    rows = [row for row in rows if row[0] != last_stream_id]
+                    reached_stream_id = last_stream_id - 1
+
+            return (
+                [
+                    (user_id, device_id, db_to_json(message_json))
+                    for _, user_id, device_id, message_json in rows
+                ],
+                reached_stream_id,
+            )
+
+        return await self.db_pool.runInteraction(
+            "get_device_messages_in_range", get_device_messages_in_range_txn
+        )
+
     @trace
     async def delete_messages_for_device(
         self,
